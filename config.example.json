@@ -1,0 +1,8 @@
+{
+  "yaml_path": "D:\\path\\to\\your\\日程.yaml",
+  "smtp_server": "smtp.qq.com",
+  "smtp_port": 465,
+  "sender_email": "your_email@qq.com",
+  "sender_password": "your_smtp_authorization_code",
+  "receiver_email": "receiver@qq.com"
+}
