@@ -444,23 +444,35 @@ class ReminderApp:
     # ---------- 事件列表 ----------
 
     def _build_events_tab(self):
-        cols = ("type", "date", "week", "location")
+        # 复选框图标
+        self.checked = "☑"
+        self.unchecked = "☐"
+
+        cols = ("status", "type", "date", "week", "location")
         self.tree = ttk.Treeview(self.frame_events, columns=cols, show="tree headings", height=15)
         self.tree.heading("#0", text="事项名称")
+        self.tree.heading("status", text="状态")
         self.tree.heading("type", text="类型")
         self.tree.heading("date", text="日期")
         self.tree.heading("week", text="周次")
         self.tree.heading("location", text="地点")
-        self.tree.column("#0", width=220)
+        self.tree.column("#0", width=200)
+        self.tree.column("status", width=40, anchor="center")
         self.tree.column("type", width=60, anchor="center")
         self.tree.column("date", width=110)
-        self.tree.column("week", width=110)
-        self.tree.column("location", width=240)
+        self.tree.column("week", width=100)
+        self.tree.column("location", width=200)
 
         scrollbar = ttk.Scrollbar(self.frame_events, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
         self.tree.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
         scrollbar.pack(side="left", fill="y", pady=6, padx=(0, 6))
+
+        # 样式
+        self.tree.tag_configure("completed", foreground="gray")
+
+        # 点击复选框
+        self.tree.bind("<Button-1>", self._on_tree_click)
 
         # 右键菜单
         self.ctx_menu = tk.Menu(self.tree, tearoff=0)
@@ -484,6 +496,9 @@ class ReminderApp:
         except Exception as e:
             messagebox.showerror("错误", f"读取 YAML 失败：{e}")
             return
+
+        # 自动标记超时事件
+        self._auto_complete_timeout(data)
 
         SEMESTER_START = date(2026, 3, 2)
         WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
@@ -509,69 +524,186 @@ class ReminderApp:
                 except ValueError:
                     pass
             if "week" in rem:
-                # 按周次排序
                 try:
                     week_num = int(rem["week"].replace("第", "").replace("周", ""))
                     return SEMESTER_START + timedelta(weeks=week_num - 1)
                 except ValueError:
                     pass
-            return date.max  # 没有日期的排最后
+            return date.max
 
-        # 按日期排序
-        reminders = data.get("reminders", [])
-        sorted_reminders = sorted(enumerate(reminders), key=lambda x: get_sort_key(x[1]))
-
-        for idx, rem in sorted_reminders:
-            name = rem.get("name", "")
-            rtype = type_labels.get(rem.get("type", ""), rem.get("type", ""))
-            loc = rem.get("location", "")
-
-            # 有 schedule 的多日事件 → 折叠展示
-            if "schedule" in rem and "start" in rem and "end" in rem:
-                start = to_date_str(rem["start"])
-                end = to_date_str(rem["end"])
-                week = rem.get("week", "")
-                parent_id = self.tree.insert("", "end", text=name,
-                                             values=(rtype, f"{start} ~ {end}", week, loc))
-                self._rem_index_map[parent_id] = idx
-
+        def get_completed_time(rem):
+            """获取完成时间，用于已完成事件排序"""
+            completed_at = rem.get("completed_at", "")
+            if completed_at:
                 try:
-                    start_d = datetime.strptime(start, "%Y-%m-%d").date()
-                    end_d = datetime.strptime(end, "%Y-%m-%d").date()
+                    return datetime.strptime(completed_at, "%Y-%m-%d %H:%M:%S")
                 except ValueError:
-                    continue
+                    pass
+            return datetime.min
 
-                for entry in rem.get("schedule", []):
-                    entry_wd = weekday_map.get(entry.get("day"))
-                    period = entry.get("period", "全天")
-                    entry_loc = entry.get("location", loc)
-                    period_label = period_labels.get(period, period)
+        # 分组：未完成和已完成
+        reminders = data.get("reminders", [])
+        pending = [(idx, rem) for idx, rem in enumerate(reminders) if not rem.get("completed")]
+        completed = [(idx, rem) for idx, rem in enumerate(reminders) if rem.get("completed")]
 
-                    if entry_wd is not None:
-                        d = start_d
-                        while d <= end_d:
-                            if d.weekday() == entry_wd:
-                                child_id = self.tree.insert(
-                                    parent_id, "end",
-                                    text=f"{entry['day']} {period_label}",
-                                    values=("", d.strftime("%Y-%m-%d"), calc_week(d), entry_loc))
-                                self._rem_index_map[child_id] = idx
-                            d += timedelta(days=1)
-            else:
-                # 单日 / 仅周次事件
-                date_str = ""
-                week_str = rem.get("week", "")
-                if "date" in rem:
-                    date_str = to_date_str(rem["date"])
-                    if not week_str:
-                        try:
-                            d = datetime.strptime(date_str, "%Y-%m-%d").date()
-                            week_str = calc_week(d)
-                        except ValueError:
-                            pass
-                item_id = self.tree.insert("", "end", text=name,
-                                           values=(rtype, date_str, week_str, loc))
-                self._rem_index_map[item_id] = idx
+        # 未完成：按日期逆序（最近的在最上面）
+        pending_sorted = sorted(pending, key=lambda x: get_sort_key(x[1]), reverse=True)
+
+        # 已完成：按完成时间顺序（最近完成的在最上面）
+        completed_sorted = sorted(completed, key=lambda x: get_completed_time(x[1]), reverse=True)
+
+        # 创建未完成分组
+        pending_count = len(pending_sorted)
+        pending_parent = self.tree.insert("", "end", text=f"未完成 ({pending_count})", open=True)
+        self._rem_index_map[pending_parent] = -1  # 标记为分组节点
+
+        for idx, rem in pending_sorted:
+            self._insert_reminder(pending_parent, idx, rem, type_labels, period_labels,
+                                  calc_week, weekday_map, completed=False)
+
+        # 创建已完成分组
+        completed_count = len(completed_sorted)
+        completed_parent = self.tree.insert("", "end", text=f"已完成 ({completed_count})", open=True)
+        self._rem_index_map[completed_parent] = -1  # 标记为分组节点
+
+        for idx, rem in completed_sorted:
+            self._insert_reminder(completed_parent, idx, rem, type_labels, period_labels,
+                                  calc_week, weekday_map, completed=True)
+
+    def _insert_reminder(self, parent, idx, rem, type_labels, period_labels, calc_week, weekday_map, completed):
+        """插入单个事件到树中"""
+        name = rem.get("name", "")
+        rtype = type_labels.get(rem.get("type", ""), rem.get("type", ""))
+        loc = rem.get("location", "")
+        status = self.checked if completed else self.unchecked
+        tags = ("completed",) if completed else ()
+
+        # 格式化完成时间
+        completed_str = ""
+        if completed and rem.get("completed_at"):
+            try:
+                dt = datetime.strptime(rem["completed_at"], "%Y-%m-%d %H:%M:%S")
+                completed_str = f"完成于 {dt.strftime('%m-%d')}"
+            except ValueError:
+                pass
+
+        # 有 schedule 的多日事件
+        if "schedule" in rem and "start" in rem and "end" in rem:
+            start = to_date_str(rem["start"])
+            end = to_date_str(rem["end"])
+            week = rem.get("week", "")
+            date_display = f"{start} ~ {end}"
+            if completed_str:
+                date_display += f"  {completed_str}"
+            parent_id = self.tree.insert(parent, "end", text=name,
+                                         values=(status, rtype, date_display, week, loc),
+                                         tags=tags)
+            self._rem_index_map[parent_id] = idx
+
+            try:
+                start_d = datetime.strptime(start, "%Y-%m-%d").date()
+                end_d = datetime.strptime(end, "%Y-%m-%d").date()
+            except ValueError:
+                return
+
+            for entry in rem.get("schedule", []):
+                entry_wd = weekday_map.get(entry.get("day"))
+                period = entry.get("period", "全天")
+                entry_loc = entry.get("location", loc)
+                period_label = period_labels.get(period, period)
+
+                if entry_wd is not None:
+                    d = start_d
+                    while d <= end_d:
+                        if d.weekday() == entry_wd:
+                            child_id = self.tree.insert(
+                                parent_id, "end",
+                                text=f"{entry['day']} {period_label}",
+                                values=("", "", d.strftime("%Y-%m-%d"), calc_week(d), entry_loc),
+                                tags=tags)
+                            self._rem_index_map[child_id] = idx
+                        d += timedelta(days=1)
+        else:
+            # 单日 / 仅周次事件
+            date_str = ""
+            week_str = rem.get("week", "")
+            if "date" in rem:
+                date_str = to_date_str(rem["date"])
+                if not week_str:
+                    try:
+                        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+                        week_str = calc_week(d)
+                    except ValueError:
+                        pass
+            if completed_str:
+                date_str += f"  {completed_str}"
+            item_id = self.tree.insert(parent, "end", text=name,
+                                       values=(status, rtype, date_str, week_str, loc),
+                                       tags=tags)
+            self._rem_index_map[item_id] = idx
+
+    def _auto_complete_timeout(self, data):
+        """自动标记超时12小时的事件"""
+        now = datetime.now()
+        changed = False
+
+        for rem in data.get("reminders", []):
+            if rem.get("completed"):
+                continue
+
+            event_date = rem.get("date") or rem.get("start")
+            if not event_date:
+                continue
+
+            try:
+                event_dt = datetime.strptime(str(event_date), "%Y-%m-%d")
+                if (now - event_dt).total_seconds() > 12 * 3600:
+                    rem["completed"] = True
+                    rem["completed_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                    changed = True
+            except ValueError:
+                pass
+
+        if changed:
+            save_yaml(self.cfg["yaml_path"], data)
+
+    def _on_tree_click(self, event):
+        """点击复选框切换完成状态"""
+        region = self.tree.identify_region(event.x, event.y)
+        if region != "cell":
+            return
+
+        column = self.tree.identify_column(event.x)
+        item = self.tree.identify_row(event.y)
+
+        # 点击状态列（#1）或名称列（#0）
+        if column not in ("#1", "#0"):
+            return
+
+        # 获取事件索引
+        idx = self._rem_index_map.get(item)
+        if idx is None or idx < 0:
+            return  # 分组节点，忽略
+
+        # 切换完成状态
+        self._toggle_complete(idx)
+
+    def _toggle_complete(self, idx):
+        """切换事件的完成状态"""
+        data = load_yaml(self.cfg["yaml_path"])
+        rem = data["reminders"][idx]
+
+        if rem.get("completed"):
+            # 撤销完成
+            rem["completed"] = False
+            rem.pop("completed_at", None)
+        else:
+            # 标记完成
+            rem["completed"] = True
+            rem["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        save_yaml(self.cfg["yaml_path"], data)
+        self._load_events()
 
     def _show_ctx_menu(self, event):
         item = self.tree.identify_row(event.y)
@@ -584,7 +716,11 @@ class ReminderApp:
         if not sel:
             messagebox.showinfo("提示", "请先选择一条事件")
             return None
-        return self._rem_index_map.get(sel[0])
+        idx = self._rem_index_map.get(sel[0])
+        if idx is None or idx < 0:
+            messagebox.showinfo("提示", "请先选择一条事件")
+            return None
+        return idx
 
     def _add_event(self):
         EventDialog(self.root, "添加事件", callback=self._save_new_event)
