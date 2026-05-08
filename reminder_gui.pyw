@@ -1,6 +1,6 @@
 """
 日程提醒工具 - 图形化界面
-功能：查看/管理日程事件，修改配置（YAML路径、邮箱设置）
+功能：查看/管理日程事件，修改配置（YAML路径、邮箱设置），AI 智能添加日程
 """
 
 import json
@@ -9,10 +9,35 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime, date, timedelta
 import yaml
+import threading
 
 # ============ 配置文件路径 ============
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+HISTORY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_history.json")
+
+# AI 服务商配置
+AI_PROVIDERS = {
+    "zhipu": {
+        "name": "智谱 GLM",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        "models": [
+            {"id": "glm-4-flash", "name": "glm-4-flash（免费）", "free": True},
+            {"id": "glm-4", "name": "glm-4", "free": False},
+            {"id": "glm-4v", "name": "glm-4v", "free": False},
+        ],
+        "default_model": "glm-4-flash"
+    },
+    "qwen": {
+        "name": "通义千问",
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        "models": [
+            {"id": "qwen-turbo", "name": "qwen-turbo（免费）", "free": True},
+            {"id": "qwen-plus", "name": "qwen-plus", "free": False},
+        ],
+        "default_model": "qwen-turbo"
+    }
+}
 
 DEFAULT_CONFIG = {
     "yaml_path": "",
@@ -21,6 +46,9 @@ DEFAULT_CONFIG = {
     "sender_email": "",
     "sender_password": "",
     "receiver_email": "",
+    "ai_provider": "zhipu",
+    "ai_model": "glm-4-flash",
+    "ai_api_key": "",
 }
 
 
@@ -37,6 +65,43 @@ def load_config():
 def save_config(cfg):
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+# ============ 对话历史 ============
+
+MAX_HISTORY = 100
+
+
+def load_history():
+    if os.path.exists(HISTORY_PATH):
+        with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"history": []}
+
+
+def save_history(data):
+    with open(HISTORY_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def add_history(role, content, event=None):
+    data = load_history()
+    entry = {
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "role": role,
+        "content": content,
+    }
+    if event:
+        entry["event"] = event
+    data["history"].append(entry)
+    # 超过上限删除最早的
+    if len(data["history"]) > MAX_HISTORY:
+        data["history"] = data["history"][-MAX_HISTORY:]
+    save_history(data)
+
+
+def clear_history():
+    save_history({"history": []})
 
 
 # ============ YAML 操作 ============
@@ -64,11 +129,13 @@ class ReminderApp:
         self.cfg = load_config()
         self.root = tk.Tk()
         self.root.title("日程提醒工具")
-        self.root.geometry("860x520")
+        self.root.geometry("860x680")
         self.root.resizable(True, True)
+        self.ai_loading = False
 
         self._build_ui()
         self._load_events()
+        self._load_chat_history()
 
     def _build_ui(self):
         notebook = ttk.Notebook(self.root)
@@ -79,10 +146,250 @@ class ReminderApp:
         notebook.add(self.frame_events, text="事件列表")
         self._build_events_tab()
 
+        # ---- AI 助手页 ----
+        self.frame_ai = ttk.Frame(notebook)
+        notebook.add(self.frame_ai, text="AI 助手")
+        self._build_ai_tab()
+
         # ---- 设置页 ----
         self.frame_settings = ttk.Frame(notebook)
         notebook.add(self.frame_settings, text="设置")
         self._build_settings_tab()
+
+    # ---------- AI 助手 ----------
+
+    def _build_ai_tab(self):
+        # 对话历史
+        history_frame = ttk.LabelFrame(self.frame_ai, text="对话历史", padding=6)
+        history_frame.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+
+        self.chat_text = tk.Text(history_frame, height=15, wrap="word", state="disabled",
+                                 font=("微软雅黑", 9))
+        chat_scrollbar = ttk.Scrollbar(history_frame, orient="vertical", command=self.chat_text.yview)
+        self.chat_text.configure(yscrollcommand=chat_scrollbar.set)
+        self.chat_text.pack(side="left", fill="both", expand=True)
+        chat_scrollbar.pack(side="left", fill="y")
+
+        # 配置标签样式
+        self.chat_text.tag_configure("user", foreground="#0066cc")
+        self.chat_text.tag_configure("assistant", foreground="#006600")
+        self.chat_text.tag_configure("error", foreground="#cc0000")
+        self.chat_text.tag_configure("time", foreground="#888888", font=("微软雅黑", 8))
+
+        # 清空历史按钮
+        btn_frame = ttk.Frame(history_frame)
+        btn_frame.pack(side="bottom", anchor="e", pady=(4, 0))
+        ttk.Button(btn_frame, text="清空历史", command=self._clear_chat_history).pack(side="right")
+
+        # 输入区域
+        input_frame = ttk.Frame(self.frame_ai)
+        input_frame.pack(fill="x", padx=8, pady=(0, 8))
+
+        self.ai_input = tk.Text(input_frame, height=3, wrap="word", font=("微软雅黑", 9))
+        self.ai_input.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        self.ai_input.bind("<Return>", self._on_ai_enter)
+        self.ai_input.bind("<Shift-Return>", lambda e: None)  # Shift+Enter 换行
+
+        self.btn_send = ttk.Button(input_frame, text="发送", command=self._send_ai_message)
+        self.btn_send.pack(side="right")
+
+    def _on_ai_enter(self, event):
+        # Enter 发送，Shift+Enter 换行
+        if not event.state & 0x1:  # 没有按 Shift
+            self._send_ai_message()
+            return "break"  # 阻止默认换行
+
+    def _load_chat_history(self):
+        data = load_history()
+        self.chat_text.config(state="normal")
+        self.chat_text.delete("1.0", "end")
+        for entry in data["history"]:
+            time_str = entry["time"].split(" ")[1][:5]  # 只显示时:分
+            role = entry["role"]
+            content = entry["content"]
+            if role == "user":
+                self.chat_text.insert("end", f"[{time_str}] 你: ", "time")
+                self.chat_text.insert("end", f"{content}\n", "user")
+            else:
+                self.chat_text.insert("end", f"[{time_str}] AI: ", "time")
+                tag = "error" if "失败" in content or "错误" in content else "assistant"
+                self.chat_text.insert("end", f"{content}\n", tag)
+        self.chat_text.config(state="disabled")
+        self.chat_text.see("end")
+
+    def _clear_chat_history(self):
+        if not messagebox.askyesno("确认", "确定要清空所有对话历史吗？"):
+            return
+        clear_history()
+        self._load_chat_history()
+
+    def _append_chat(self, role, content, tag="assistant"):
+        time_str = datetime.now().strftime("%H:%M")
+        self.chat_text.config(state="normal")
+        if role == "user":
+            self.chat_text.insert("end", f"[{time_str}] 你: ", "time")
+            self.chat_text.insert("end", f"{content}\n", "user")
+        else:
+            self.chat_text.insert("end", f"[{time_str}] AI: ", "time")
+            self.chat_text.insert("end", f"{content}\n", tag)
+        self.chat_text.config(state="disabled")
+        self.chat_text.see("end")
+
+    def _send_ai_message(self):
+        if self.ai_loading:
+            return
+
+        user_input = self.ai_input.get("1.0", "end").strip()
+        if not user_input:
+            return
+
+        # 检查 API Key
+        if not self.cfg.get("ai_api_key"):
+            messagebox.showwarning("提示", "请先在设置中配置 AI API Key")
+            return
+
+        # 清空输入框
+        self.ai_input.delete("1.0", "end")
+
+        # 显示用户消息
+        self._append_chat("user", user_input)
+        add_history("user", user_input)
+
+        # 显示加载状态
+        self.ai_loading = True
+        self.btn_send.config(state="disabled")
+        self.ai_input.insert("1.0", "AI 思考中...")
+        self.ai_input.config(state="disabled")
+
+        # 在新线程调用 API
+        threading.Thread(target=self._call_ai_api, args=(user_input,), daemon=True).start()
+
+    def _call_ai_api(self, user_input):
+        import requests
+
+        provider_id = self.cfg.get("ai_provider", "zhipu")
+        provider = AI_PROVIDERS.get(provider_id)
+        if not provider:
+            self.root.after(0, self._ai_error, "未知的 AI 服务商")
+            return
+
+        api_key = self.cfg["ai_api_key"]
+        model = self.cfg.get("ai_model", provider["default_model"])
+        base_url = provider["base_url"]
+
+        today = date.today()
+        today_str = today.strftime("%Y-%m-%d")
+        weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+        today_weekday = weekday_names[today.weekday()]
+        system_prompt = f"""你是日程解析助手。将用户的自然语言输入解析为 JSON。
+
+当前日期：{today_str}（{today_weekday}）
+
+日期计算规则：
+- "下周五" 指的是下周的周五，不是本周
+- "下周" 是指从下周一到下周日
+- 例如：今天是周五(5月8日)，"下周五" 是 5月15日，"本周五" 是 5月8日
+- "大后天" 是今天+3天，"后天" 是今天+2天，"明天" 是今天+1天
+
+输出格式（只输出 JSON，不要其他内容）：
+{{
+  "name": "事项名称",
+  "type": "exam/class/training/other",
+  "date": "YYYY-MM-DD"
+}}
+
+注意：
+- 只包含用户明确提到的字段，没提到的不要包含
+- 如果用户没指定类型，根据语境推断（考试→exam，上课→class，实训→training）
+- 只输出 JSON，不要有其他文字
+- 请仔细计算日期，确保正确"""
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_input}
+            ],
+            "temperature": 0.1
+        }
+
+        try:
+            resp = requests.post(base_url, headers=headers, json=payload, timeout=30)
+            resp.raise_for_status()
+            result = resp.json()
+
+            # 提取 AI 回复
+            ai_content = result["choices"][0]["message"]["content"].strip()
+
+            # 解析 JSON
+            try:
+                # 尝试提取 JSON（可能被 markdown 包裹）
+                if "```" in ai_content:
+                    json_str = ai_content.split("```")[1]
+                    if json_str.startswith("json"):
+                        json_str = json_str[4:]
+                else:
+                    json_str = ai_content
+
+                event_data = json.loads(json_str.strip())
+
+                # 确保有 name 字段
+                if "name" not in event_data:
+                    self.root.after(0, self._ai_error, "AI 返回的数据缺少事项名称")
+                    return
+
+                # 转换日期格式并过滤空字段
+                cleaned_data = {}
+                for key, val in event_data.items():
+                    if val is None or val == "":
+                        continue
+                    if key in ["date", "start", "end"]:
+                        cleaned_data[key] = str(val)
+                    else:
+                        cleaned_data[key] = val
+                event_data = cleaned_data
+
+                self.root.after(0, self._ai_success, user_input, event_data)
+
+            except json.JSONDecodeError:
+                self.root.after(0, self._ai_error, f"AI 返回格式错误：\n{ai_content}")
+
+        except requests.exceptions.Timeout:
+            self.root.after(0, self._ai_error, "请求超时，请检查网络后重试")
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401:
+                self.root.after(0, self._ai_error, "API Key 无效，请检查设置")
+            elif e.response.status_code == 429:
+                self.root.after(0, self._ai_error, "API 余额不足或请求过于频繁")
+            else:
+                self.root.after(0, self._ai_error, f"请求失败：{e}")
+        except Exception as e:
+            self.root.after(0, self._ai_error, f"发生错误：{e}")
+
+    def _ai_success(self, user_input, event_data):
+        self._reset_ai_input()
+        self._append_chat("assistant", f"已解析事件「{event_data.get('name', '')}」，请确认")
+        add_history("assistant", f"已创建事件「{event_data.get('name', '')}」", event=event_data)
+
+        # 弹出编辑框让用户确认
+        EventDialog(self.root, "AI 解析结果（请确认或修改）", reminder=event_data,
+                    callback=self._save_new_event)
+
+    def _ai_error(self, error_msg):
+        self._reset_ai_input()
+        self._append_chat("assistant", f"失败：{error_msg}", tag="error")
+        add_history("assistant", f"失败：{error_msg}")
+
+    def _reset_ai_input(self):
+        self.ai_loading = False
+        self.btn_send.config(state="normal")
+        self.ai_input.config(state="normal")
+        self.ai_input.delete("1.0", "end")
 
     # ---------- 事件列表 ----------
 
@@ -139,7 +446,32 @@ class ReminderApp:
             week_num = (d - SEMESTER_START).days // 7 + 1
             return f"第{week_num}周{WEEKDAY_NAMES[d.weekday()]}"
 
-        for idx, rem in enumerate(data.get("reminders", [])):
+        def get_sort_key(rem):
+            """获取排序用的日期，没有日期的排最后"""
+            if "date" in rem:
+                try:
+                    return datetime.strptime(str(rem["date"]), "%Y-%m-%d").date()
+                except ValueError:
+                    pass
+            if "start" in rem:
+                try:
+                    return datetime.strptime(str(rem["start"]), "%Y-%m-%d").date()
+                except ValueError:
+                    pass
+            if "week" in rem:
+                # 按周次排序
+                try:
+                    week_num = int(rem["week"].replace("第", "").replace("周", ""))
+                    return SEMESTER_START + timedelta(weeks=week_num - 1)
+                except ValueError:
+                    pass
+            return date.max  # 没有日期的排最后
+
+        # 按日期排序
+        reminders = data.get("reminders", [])
+        sorted_reminders = sorted(enumerate(reminders), key=lambda x: get_sort_key(x[1]))
+
+        for idx, rem in sorted_reminders:
             name = rem.get("name", "")
             rtype = type_labels.get(rem.get("type", ""), rem.get("type", ""))
             loc = rem.get("location", "")
@@ -303,8 +635,25 @@ class ReminderApp:
     # ---------- 设置页 ----------
 
     def _build_settings_tab(self):
-        frame = ttk.LabelFrame(self.frame_settings, text="配置", padding=12)
-        frame.pack(fill="x", padx=12, pady=12)
+        # 创建可滚动的画布
+        canvas = tk.Canvas(self.frame_settings)
+        scrollbar = ttk.Scrollbar(self.frame_settings, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True, padx=12, pady=12)
+        scrollbar.pack(side="right", fill="y")
+
+        # 邮件配置
+        mail_frame = ttk.LabelFrame(scrollable_frame, text="邮件配置", padding=12)
+        mail_frame.pack(fill="x", padx=0, pady=(0, 12))
 
         fields = [
             ("YAML 文件路径", "yaml_path", True),
@@ -316,19 +665,73 @@ class ReminderApp:
         ]
         self.setting_vars = {}
         for i, (label, key, browse) in enumerate(fields):
-            ttk.Label(frame, text=label).grid(row=i, column=0, sticky="e", padx=(0, 8), pady=4)
+            ttk.Label(mail_frame, text=label).grid(row=i, column=0, sticky="e", padx=(0, 8), pady=4)
             var = tk.StringVar(value=str(self.cfg.get(key, "")))
             self.setting_vars[key] = var
-            entry = ttk.Entry(frame, textvariable=var, width=52, show="*" if "password" in key else "")
+            entry = ttk.Entry(mail_frame, textvariable=var, width=52, show="*" if "password" in key else "")
             entry.grid(row=i, column=1, sticky="w", pady=4)
             if browse:
-                ttk.Button(frame, text="浏览", width=6,
+                ttk.Button(mail_frame, text="浏览", width=6,
                            command=lambda v=var: self._browse_yaml(v)).grid(row=i, column=2, padx=(6, 0), pady=4)
 
-        btn_frame = ttk.Frame(frame)
-        btn_frame.grid(row=len(fields), column=0, columnspan=3, pady=(12, 0))
-        ttk.Button(btn_frame, text="保存设置", command=self._save_settings).pack(side="left", padx=4)
-        ttk.Button(btn_frame, text="测试邮件", command=self._test_email).pack(side="left", padx=4)
+        mail_btn_frame = ttk.Frame(mail_frame)
+        mail_btn_frame.grid(row=len(fields), column=0, columnspan=3, pady=(12, 0))
+        ttk.Button(mail_btn_frame, text="保存设置", command=self._save_settings).pack(side="left", padx=4)
+        ttk.Button(mail_btn_frame, text="测试邮件", command=self._test_email).pack(side="left", padx=4)
+
+        # AI 配置
+        ai_frame = ttk.LabelFrame(scrollable_frame, text="AI 配置", padding=12)
+        ai_frame.pack(fill="x", padx=0, pady=(0, 12))
+
+        # AI 服务商
+        ttk.Label(ai_frame, text="AI 服务商").grid(row=0, column=0, sticky="e", padx=(0, 8), pady=4)
+        self.ai_provider_var = tk.StringVar(value=self.cfg.get("ai_provider", "zhipu"))
+        provider_names = [v["name"] for v in AI_PROVIDERS.values()]
+        provider_ids = list(AI_PROVIDERS.keys())
+        self.provider_combo = ttk.Combobox(ai_frame, textvariable=self.ai_provider_var,
+                                           values=provider_names, state="readonly", width=20)
+        self.provider_combo.grid(row=0, column=1, sticky="w", pady=4)
+        self.provider_combo.current(provider_ids.index(self.cfg.get("ai_provider", "zhipu")))
+        self.provider_combo.bind("<<ComboboxSelected>>", self._on_provider_change)
+
+        # AI 模型
+        ttk.Label(ai_frame, text="AI 模型").grid(row=1, column=0, sticky="e", padx=(0, 8), pady=4)
+        self.ai_model_var = tk.StringVar(value=self.cfg.get("ai_model", "glm-4-flash"))
+        self.model_combo = ttk.Combobox(ai_frame, textvariable=self.ai_model_var,
+                                        state="readonly", width=30)
+        self.model_combo.grid(row=1, column=1, sticky="w", pady=4)
+        self._update_model_list()
+
+        # API Key
+        ttk.Label(ai_frame, text="API Key").grid(row=2, column=0, sticky="e", padx=(0, 8), pady=4)
+        self.ai_key_var = tk.StringVar(value=self.cfg.get("ai_api_key", ""))
+        ttk.Entry(ai_frame, textvariable=self.ai_key_var, width=52, show="*").grid(
+            row=2, column=1, sticky="w", pady=4)
+
+        ai_btn_frame = ttk.Frame(ai_frame)
+        ai_btn_frame.grid(row=3, column=0, columnspan=2, pady=(12, 0))
+        ttk.Button(ai_btn_frame, text="保存 AI 设置", command=self._save_ai_settings).pack(side="left", padx=4)
+
+    def _on_provider_change(self, event):
+        self._update_model_list()
+
+    def _update_model_list(self):
+        provider_names = [v["name"] for v in AI_PROVIDERS.values()]
+        provider_ids = list(AI_PROVIDERS.keys())
+        idx = self.provider_combo.current()
+        if idx < 0:
+            idx = 0
+        provider_id = provider_ids[idx]
+        provider = AI_PROVIDERS[provider_id]
+        model_names = [m["name"] for m in provider["models"]]
+        self.model_combo["values"] = model_names
+        # 设置当前模型
+        current_model = self.cfg.get("ai_model", provider["default_model"])
+        for i, m in enumerate(provider["models"]):
+            if m["id"] == current_model:
+                self.model_combo.current(i)
+                return
+        self.model_combo.current(0)
 
     def _browse_yaml(self, var):
         path = filedialog.askopenfilename(
@@ -351,6 +754,27 @@ class ReminderApp:
         save_config(self.cfg)
         messagebox.showinfo("成功", "设置已保存")
         self._load_events()
+
+    def _save_ai_settings(self):
+        provider_names = [v["name"] for v in AI_PROVIDERS.values()]
+        provider_ids = list(AI_PROVIDERS.keys())
+        idx = self.provider_combo.current()
+        if idx < 0:
+            idx = 0
+        provider_id = provider_ids[idx]
+        provider = AI_PROVIDERS[provider_id]
+
+        model_idx = self.model_combo.current()
+        if model_idx < 0:
+            model_idx = 0
+        model_id = provider["models"][model_idx]["id"]
+
+        self.cfg["ai_provider"] = provider_id
+        self.cfg["ai_model"] = model_id
+        self.cfg["ai_api_key"] = self.ai_key_var.get().strip()
+
+        save_config(self.cfg)
+        messagebox.showinfo("成功", "AI 设置已保存")
 
     def _test_email(self):
         import smtplib

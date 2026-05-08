@@ -4,5 +4,8 @@
   "smtp_port": 465,
   "sender_email": "your_email@qq.com",
   "sender_password": "your_smtp_authorization_code",
-  "receiver_email": "receiver@qq.com"
+  "receiver_email": "receiver@qq.com",
+  "ai_provider": "zhipu",
+  "ai_model": "glm-4-flash",
+  "ai_api_key": ""
 }
