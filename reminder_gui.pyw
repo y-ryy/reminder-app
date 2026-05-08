@@ -389,10 +389,11 @@ class EventDialog:
         self.callback = callback
         self.reminder = reminder or {}
         self.result = None
+        self.schedule_list = []  # 存储 schedule 数据
 
         self.win = tk.Toplevel(parent)
         self.win.title(title)
-        self.win.geometry("480x420")
+        self.win.geometry("520x580")
         self.win.resizable(False, False)
         self.win.grab_set()
 
@@ -401,37 +402,101 @@ class EventDialog:
             self._fill(reminder)
 
     def _build(self):
-        frame = ttk.LabelFrame(self.win, text="事件信息", padding=10)
-        frame.pack(fill="both", expand=True, padx=10, pady=10)
+        # 基本信息区域
+        info_frame = ttk.LabelFrame(self.win, text="事件信息", padding=10)
+        info_frame.pack(fill="x", padx=10, pady=(10, 5))
 
         fields = [
-            ("事项名称", "name"),
-            ("类型（exam/class/training/other）", "type"),
+            ("事项名称 *", "name"),
+            ("类型", "type"),
             ("地点", "location"),
-            ("周次（如 第13周）", "week"),
-            ("日期（YYYY-MM-DD）", "date"),
-            ("时段（morning/afternoon/evening）", "time"),
-            ("开始日期（YYYY-MM-DD）", "start"),
-            ("结束日期（YYYY-MM-DD）", "end"),
+            ("周次", "week"),
+            ("日期", "date"),
+            ("时段", "time"),
+            ("开始日期", "start"),
+            ("结束日期", "end"),
         ]
         self.vars = {}
         for i, (label, key) in enumerate(fields):
-            ttk.Label(frame, text=label).grid(row=i, column=0, sticky="e", padx=(0, 8), pady=3)
+            row, col = divmod(i, 2)
+            ttk.Label(info_frame, text=label).grid(row=row, column=col * 2, sticky="e", padx=(0, 4), pady=3)
             var = tk.StringVar()
             self.vars[key] = var
-            ttk.Entry(frame, textvariable=var, width=36).grid(row=i, column=1, sticky="w", pady=3)
+            width = 18 if col == 1 else 16
+            ttk.Entry(info_frame, textvariable=var, width=width).grid(
+                row=row, column=col * 2 + 1, sticky="w", padx=(0, 12), pady=3)
 
-        # schedule 区域
-        ttk.Label(frame, text="每日安排（JSON格式）").grid(row=len(fields), column=0, sticky="ne", padx=(0, 8), pady=3)
-        self.schedule_text = tk.Text(frame, width=36, height=4, font=("Consolas", 9))
-        self.schedule_text.grid(row=len(fields), column=1, sticky="w", pady=3)
-        ttk.Label(frame, text='例: [{"day":"周二","period":"3-4","location":"新安215"}]',
-                  font=("", 8)).grid(row=len(fields) + 1, column=1, sticky="w")
+        # 类型提示
+        ttk.Label(info_frame, text="类型: exam/class/training/other", font=("", 8),
+                  foreground="gray").grid(row=4, column=0, columnspan=4, sticky="w")
 
+        # 每日安排区域
+        sched_frame = ttk.LabelFrame(self.win, text="每日安排（用于多日事件，如实训、课程）", padding=10)
+        sched_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        # 已添加的安排列表
+        cols = ("day", "period", "location")
+        self.sched_tree = ttk.Treeview(sched_frame, columns=cols, show="headings", height=5)
+        self.sched_tree.heading("day", text="星期")
+        self.sched_tree.heading("period", text="时段")
+        self.sched_tree.heading("location", text="地点")
+        self.sched_tree.column("day", width=80)
+        self.sched_tree.column("period", width=100)
+        self.sched_tree.column("location", width=200)
+        self.sched_tree.pack(fill="both", expand=True, pady=(0, 8))
+
+        # 添加安排的输入区域
+        add_frame = ttk.Frame(sched_frame)
+        add_frame.pack(fill="x")
+
+        ttk.Label(add_frame, text="星期").pack(side="left", padx=(0, 4))
+        self.day_var = tk.StringVar(value="周一")
+        day_combo = ttk.Combobox(add_frame, textvariable=self.day_var, width=6,
+                                 values=["周一", "周二", "周三", "周四", "周五", "周六", "周日"],
+                                 state="readonly")
+        day_combo.pack(side="left", padx=(0, 8))
+
+        ttk.Label(add_frame, text="时段").pack(side="left", padx=(0, 4))
+        self.period_var = tk.StringVar(value="1-4")
+        period_combo = ttk.Combobox(add_frame, textvariable=self.period_var, width=8,
+                                    values=["1-4", "5-8", "evening", "全天"],
+                                    state="readonly")
+        period_combo.pack(side="left", padx=(0, 8))
+
+        ttk.Label(add_frame, text="地点").pack(side="left", padx=(0, 4))
+        self.sched_loc_var = tk.StringVar()
+        ttk.Entry(add_frame, textvariable=self.sched_loc_var, width=14).pack(side="left", padx=(0, 8))
+
+        ttk.Button(add_frame, text="添加", width=6, command=self._add_schedule).pack(side="left")
+        ttk.Button(add_frame, text="删除选中", width=8, command=self._del_schedule).pack(side="left", padx=(4, 0))
+
+        # 底部按钮
         btn_frame = ttk.Frame(self.win)
-        btn_frame.pack(pady=(0, 10))
+        btn_frame.pack(pady=10)
         ttk.Button(btn_frame, text="确定", command=self._on_ok).pack(side="left", padx=8)
         ttk.Button(btn_frame, text="取消", command=self.win.destroy).pack(side="left", padx=8)
+
+    def _add_schedule(self):
+        day = self.day_var.get()
+        period = self.period_var.get()
+        location = self.sched_loc_var.get().strip()
+
+        if not location:
+            messagebox.showwarning("提示", "请输入地点")
+            return
+
+        self.schedule_list.append({"day": day, "period": period, "location": location})
+        self.sched_tree.insert("", "end", values=(day, period, location))
+        self.sched_loc_var.set("")
+
+    def _del_schedule(self):
+        sel = self.sched_tree.selection()
+        if not sel:
+            return
+        for item in sel:
+            idx = self.sched_tree.index(item)
+            self.schedule_list.pop(idx)
+            self.sched_tree.delete(item)
 
     def _fill(self, rem):
         for key, var in self.vars.items():
@@ -440,7 +505,13 @@ class EventDialog:
                 val = val.strftime("%Y-%m-%d")
             var.set(str(val))
         if "schedule" in rem:
-            self.schedule_text.insert("1.0", json.dumps(rem["schedule"], ensure_ascii=False))
+            self.schedule_list = rem["schedule"]
+            for entry in self.schedule_list:
+                self.sched_tree.insert("", "end", values=(
+                    entry.get("day", ""),
+                    entry.get("period", ""),
+                    entry.get("location", "")
+                ))
 
     def _on_ok(self):
         rem = {}
@@ -457,13 +528,8 @@ class EventDialog:
             messagebox.showwarning("提示", f"类型只能是：{', '.join(valid_types)}")
             return
         # schedule
-        sched_str = self.schedule_text.get("1.0", "end").strip()
-        if sched_str:
-            try:
-                rem["schedule"] = json.loads(sched_str)
-            except json.JSONDecodeError:
-                messagebox.showerror("错误", "每日安排的 JSON 格式不正确")
-                return
+        if self.schedule_list:
+            rem["schedule"] = self.schedule_list
         if self.callback:
             self.callback(rem)
         self.win.destroy()
