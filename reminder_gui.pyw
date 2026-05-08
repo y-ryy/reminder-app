@@ -116,6 +116,9 @@ def save_yaml(path, data):
         yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
 
+SEMESTER_START = date(2026, 3, 2)
+
+
 def to_date_str(val):
     if isinstance(val, date):
         return val.strftime("%Y-%m-%d")
@@ -136,6 +139,8 @@ class ReminderApp:
         self._build_ui()
         self._load_events()
         self._load_chat_history()
+        self._start_reminder_checker()
+        self._send_startup_reminder()
 
     def _build_ui(self):
         notebook = ttk.Notebook(self.root)
@@ -500,6 +505,9 @@ class ReminderApp:
         # 自动标记超时事件
         self._auto_complete_timeout(data)
 
+        # 为缺少提醒点的事件自动生成
+        self._regenerate_reminders(data)
+
         SEMESTER_START = date(2026, 3, 2)
         WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
         weekday_map = {"周一": 0, "周二": 1, "周三": 2, "周四": 3, "周五": 4, "周六": 5, "周日": 6}
@@ -546,8 +554,8 @@ class ReminderApp:
         pending = [(idx, rem) for idx, rem in enumerate(reminders) if not rem.get("completed")]
         completed = [(idx, rem) for idx, rem in enumerate(reminders) if rem.get("completed")]
 
-        # 未完成：按日期逆序（最近的在最上面）
-        pending_sorted = sorted(pending, key=lambda x: get_sort_key(x[1]), reverse=True)
+        # 未完成：按日期正序（最近的在最上面）
+        pending_sorted = sorted(pending, key=lambda x: get_sort_key(x[1]))
 
         # 已完成：按完成时间顺序（最近完成的在最上面）
         completed_sorted = sorted(completed, key=lambda x: get_completed_time(x[1]), reverse=True)
@@ -667,6 +675,16 @@ class ReminderApp:
         if changed:
             save_yaml(self.cfg["yaml_path"], data)
 
+    def _regenerate_reminders(self, data):
+        """为缺少提醒点的事件自动生成（迁移旧数据）"""
+        changed = False
+        for rem in data.get("reminders", []):
+            if "reminders" not in rem:
+                self._generate_reminders(rem)
+                changed = True
+        if changed:
+            save_yaml(self.cfg["yaml_path"], data)
+
     def _on_tree_click(self, event):
         """点击复选框切换完成状态"""
         region = self.tree.identify_region(event.x, event.y)
@@ -726,6 +744,7 @@ class ReminderApp:
         EventDialog(self.root, "添加事件", callback=self._save_new_event)
 
     def _save_new_event(self, rem):
+        self._generate_reminders(rem)
         data = load_yaml(self.cfg["yaml_path"])
         data.setdefault("reminders", []).append(rem)
         save_yaml(self.cfg["yaml_path"], data)
@@ -741,6 +760,7 @@ class ReminderApp:
                     callback=lambda r: self._save_edited_event(idx, r))
 
     def _save_edited_event(self, idx, rem):
+        self._generate_reminders(rem)
         data = load_yaml(self.cfg["yaml_path"])
         data["reminders"][idx] = rem
         save_yaml(self.cfg["yaml_path"], data)
@@ -817,6 +837,190 @@ class ReminderApp:
         except Exception as e:
             messagebox.showerror("邮件发送失败", str(e))
             return False
+
+    def _send_email_silent(self, title, content):
+        """静默发送邮件，不弹窗"""
+        import smtplib
+        from email.mime.text import MIMEText
+        try:
+            msg = MIMEText(content, "plain", "utf-8")
+            msg["From"] = self.cfg["sender_email"]
+            msg["To"] = self.cfg["receiver_email"]
+            msg["Subject"] = title
+            with smtplib.SMTP_SSL(self.cfg["smtp_server"], int(self.cfg["smtp_port"])) as server:
+                server.login(self.cfg["sender_email"], self.cfg["sender_password"])
+                server.sendmail(self.cfg["sender_email"], self.cfg["receiver_email"], msg.as_string())
+            return True
+        except Exception:
+            return False
+
+    def _generate_reminders(self, rem):
+        """根据事件精度自动生成提醒时间点"""
+        period_hours = {"1-4": 6, "5-8": 10, "evening": 14, "全天": 7}
+        reminders = []
+
+        # 已完成事件不生成提醒
+        if rem.get("completed"):
+            rem["reminders"] = []
+            return
+
+        # 只有周次
+        if "week" in rem and "date" not in rem and "start" not in rem:
+            try:
+                week_num = int(rem["week"].replace("第", "").replace("周", ""))
+                week_monday = SEMESTER_START + timedelta(weeks=week_num - 1)
+                prev_monday = week_monday - timedelta(days=7)
+                prev_sunday = week_monday - timedelta(days=1)
+                reminders.append({"time": f"{prev_monday} 20:00", "sent": False})
+                reminders.append({"time": f"{prev_sunday} 20:00", "sent": False})
+            except ValueError:
+                pass
+
+        # 具体日期（单日）
+        elif "date" in rem:
+            try:
+                event_date = datetime.strptime(str(rem["date"]), "%Y-%m-%d")
+                day_before = event_date - timedelta(days=1)
+                reminders.append({"time": day_before.strftime("%Y-%m-%d") + " 20:00", "sent": False})
+                time_val = rem.get("time", "全天")
+                hour = period_hours.get(time_val, 7)
+                reminders.append({"time": event_date.strftime("%Y-%m-%d") + f" {hour:02d}:00", "sent": False})
+            except ValueError:
+                pass
+
+        # 多日周期事件
+        elif "start" in rem and "end" in rem:
+            try:
+                start_dt = datetime.strptime(str(rem["start"]), "%Y-%m-%d")
+                end_dt = datetime.strptime(str(rem["end"]), "%Y-%m-%d")
+                day_before = start_dt - timedelta(days=1)
+                reminders.append({"time": day_before.strftime("%Y-%m-%d") + " 20:00", "sent": False})
+                d = start_dt
+                while d <= end_dt:
+                    if d.weekday() == 0:  # 周一
+                        reminders.append({"time": d.strftime("%Y-%m-%d") + " 07:30", "sent": False})
+                    d += timedelta(days=1)
+            except ValueError:
+                pass
+
+        rem["reminders"] = reminders
+
+    def _send_startup_reminder(self):
+        """启动时发送今天和明天的未完成任务汇总"""
+        try:
+            data = load_yaml(self.cfg["yaml_path"])
+        except Exception:
+            return
+
+        today = date.today()
+        tomorrow = today + timedelta(days=1)
+        today_str = today.strftime("%Y-%m-%d")
+        tomorrow_str = tomorrow.strftime("%Y-%m-%d")
+
+        today_tasks = []
+        tomorrow_tasks = []
+        period_labels = {"1-4": "1~4节", "5-8": "5~8节", "evening": "晚课", "全天": "全天"}
+
+        for rem in data.get("reminders", []):
+            if rem.get("completed"):
+                continue
+            event_date = rem.get("date") or rem.get("start")
+            if not event_date:
+                continue
+            event_date_str = str(event_date)
+            name = rem.get("name", "")
+            loc = rem.get("location", "")
+            time_val = rem.get("time", "")
+            time_label = period_labels.get(time_val, time_val) if time_val else ""
+            week = rem.get("week", "")
+            parts = [f"  - {name}"]
+            if loc:
+                parts.append(f"地点: {loc}")
+            if time_label:
+                parts.append(f"时间: {time_label}")
+            elif week:
+                parts.append(f"周次: {week}")
+            line = "  ".join(parts)
+            if event_date_str == today_str:
+                today_tasks.append(line)
+            elif event_date_str == tomorrow_str:
+                tomorrow_tasks.append(line)
+
+        if not today_tasks and not tomorrow_tasks:
+            return
+
+        lines = ["日程提醒启动报告", ""]
+        if today_tasks:
+            lines.append(f"【今日任务 {today_str}】")
+            lines.extend(today_tasks)
+            lines.append("")
+        if tomorrow_tasks:
+            lines.append(f"【明日任务 {tomorrow_str}】")
+            lines.extend(tomorrow_tasks)
+        lines.append("")
+        lines.append("此邮件由日程提醒工具自动发送")
+
+        message = "\n".join(lines)
+        self._send_email_silent(f"日程提醒：今日{len(today_tasks)}项 明日{len(tomorrow_tasks)}项", message)
+
+    def _start_reminder_checker(self):
+        """启动定时提醒检查线程（每60秒检查一次）"""
+        import threading
+        threading.Thread(target=self._reminder_checker_loop, daemon=True).start()
+
+    def _reminder_checker_loop(self):
+        """定时提醒检查循环"""
+        import time
+        while True:
+            time.sleep(60)
+            try:
+                self._check_due_reminders()
+            except Exception:
+                pass
+
+    def _check_due_reminders(self):
+        """检查并发送到期的定时提醒"""
+        try:
+            data = load_yaml(self.cfg["yaml_path"])
+        except Exception:
+            return
+
+        now = datetime.now()
+        now_str = now.strftime("%Y-%m-%d %H:%M")
+        changed = False
+        period_labels = {"1-4": "1~4节", "5-8": "5~8节", "evening": "晚课", "全天": "全天"}
+
+        for rem in data.get("reminders", []):
+            if not rem.get("reminders"):
+                continue
+            for reminder in rem["reminders"]:
+                if reminder.get("sent"):
+                    continue
+                reminder_time = reminder.get("time", "")
+                if reminder_time == now_str:
+                    name = rem.get("name", "")
+                    loc = rem.get("location", "")
+                    event_date = rem.get("date") or rem.get("start") or ""
+                    time_val = rem.get("time", "")
+                    time_label = period_labels.get(time_val, time_val) if time_val else ""
+                    week = rem.get("week", "")
+                    parts = [f"事项：{name}"]
+                    if loc:
+                        parts.append(f"地点：{loc}")
+                    if event_date:
+                        parts.append(f"日期：{event_date}")
+                    if time_label:
+                        parts.append(f"时段：{time_label}")
+                    elif week:
+                        parts.append(f"周次：{week}")
+                    parts.append("\n此邮件由日程提醒工具自动发送")
+                    message = "\n".join(parts)
+                    self._send_email_silent(f"日程提醒：{name}", message)
+                    reminder["sent"] = True
+                    changed = True
+
+        if changed:
+            save_yaml(self.cfg["yaml_path"], data)
 
     # ---------- 设置页 ----------
 
