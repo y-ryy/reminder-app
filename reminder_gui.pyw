@@ -3,213 +3,213 @@
 功能：查看/管理日程事件，修改配置（YAML路径、邮箱设置），AI 智能添加日程
 """
 
-import json
 import os
+import sys
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime, date, timedelta
-import yaml
 import threading
 
-# ============ 配置文件路径 ============
+# 将 src/ 加入模块搜索路径
+SRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-HISTORY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_history.json")
+from config import load_config, save_config, AI_PROVIDERS, SEMESTER_START
+from storage import load_yaml, save_yaml, to_date_str, load_history, add_history, clear_history
+from notifications import send_email, send_email_silent, send_desktop
+from ai_service import call_ai_api
+from reminder_engine import (
+    generate_reminders, auto_complete_timeout, regenerate_reminders,
+    send_startup_reminder, start_reminder_checker,
+)
+from event_dialog import EventDialog
 
-# AI 服务商配置
-AI_PROVIDERS = {
-    "zhipu": {
-        "name": "智谱 GLM",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-        "models": [
-            {"id": "glm-4-flash", "name": "glm-4-flash（免费）", "free": True},
-            {"id": "glm-4", "name": "glm-4", "free": False},
-            {"id": "glm-4v", "name": "glm-4v", "free": False},
-        ],
-        "default_model": "glm-4-flash"
-    },
-    "qwen": {
-        "name": "通义千问",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-        "models": [
-            {"id": "qwen-turbo", "name": "qwen-turbo（免费）", "free": True},
-            {"id": "qwen-plus", "name": "qwen-plus", "free": False},
-        ],
-        "default_model": "qwen-turbo"
-    }
-}
-
-DEFAULT_CONFIG = {
-    "yaml_path": "",
-    "smtp_server": "smtp.qq.com",
-    "smtp_port": 465,
-    "sender_email": "",
-    "sender_password": "",
-    "receiver_email": "",
-    "ai_provider": "zhipu",
-    "ai_model": "glm-4-flash",
-    "ai_api_key": "",
-}
-
-
-def load_config():
-    if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        for k, v in DEFAULT_CONFIG.items():
-            cfg.setdefault(k, v)
-        return cfg
-    return DEFAULT_CONFIG.copy()
-
-
-def save_config(cfg):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
-
-
-# ============ 对话历史 ============
-
-MAX_HISTORY = 100
-
-
-def load_history():
-    if os.path.exists(HISTORY_PATH):
-        with open(HISTORY_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"history": []}
-
-
-def save_history(data):
-    with open(HISTORY_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def add_history(role, content, event=None):
-    data = load_history()
-    entry = {
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "role": role,
-        "content": content,
-    }
-    if event:
-        entry["event"] = event
-    data["history"].append(entry)
-    # 超过上限删除最早的
-    if len(data["history"]) > MAX_HISTORY:
-        data["history"] = data["history"][-MAX_HISTORY:]
-    save_history(data)
-
-
-def clear_history():
-    save_history({"history": []})
-
-
-# ============ YAML 操作 ============
-
-def load_yaml(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {"reminders": []}
-
-
-def save_yaml(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
-
-
-SEMESTER_START = date(2026, 3, 2)
-
-
-def to_date_str(val):
-    if isinstance(val, date):
-        return val.strftime("%Y-%m-%d")
-    return str(val) if val else ""
-
-
-# ============ GUI ============
 
 class ReminderApp:
     def __init__(self):
+        # 设置任务栏图标ID（必须在窗口创建前）
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("reminder.tool.v1")
+        except Exception:
+            pass
+
         self.cfg = load_config()
         self.root = tk.Tk()
         self.root.title("日程提醒工具")
         self.root.geometry("860x680")
         self.root.resizable(True, True)
         self.ai_loading = False
+        self.tray_icon = None
 
+        # 设置窗口图标
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "图片2.ico")
+        if os.path.exists(icon_path):
+            self.root.iconbitmap(icon_path)
+
+        self._apply_global_font()
         self._build_ui()
         self._load_events()
         self._load_chat_history()
-        self._start_reminder_checker()
-        self._send_startup_reminder()
+        start_reminder_checker(self.cfg)
+        send_startup_reminder(self.cfg)
+        self._setup_tray()
 
     def _build_ui(self):
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill="both", expand=True, padx=6, pady=6)
 
-        # ---- 事件列表页 ----
         self.frame_events = ttk.Frame(notebook)
         notebook.add(self.frame_events, text="事件列表")
         self._build_events_tab()
 
-        # ---- AI 助手页 ----
         self.frame_ai = ttk.Frame(notebook)
         notebook.add(self.frame_ai, text="AI 助手")
         self._build_ai_tab()
 
-        # ---- 设置页 ----
         self.frame_settings = ttk.Frame(notebook)
         notebook.add(self.frame_settings, text="设置")
         self._build_settings_tab()
 
-    # ---------- AI 助手 ----------
+    # ==================== 字体管理 ====================
+
+    def _get_font(self, size=None):
+        family = self.cfg.get("font_family", "微软雅黑")
+        if size is None:
+            size = self.cfg.get("font_size", 14)
+        return (family, size)
+
+    def _apply_global_font(self):
+        """将字体设置应用到所有 ttk 控件"""
+        family, size = self._get_font()
+        style = ttk.Style()
+        style.configure(".", font=(family, size))
+        style.configure("Treeview", font=(family, size), rowheight=int(size * 2))
+        style.configure("Treeview.Heading", font=(family, size))
+        style.configure("TLabel", font=(family, size))
+        style.configure("TButton", font=(family, size))
+        style.configure("TCheckbutton", font=(family, size))
+        style.configure("TLabelframe.Label", font=(family, size))
+        style.configure("TCombobox", font=(family, size))
+        style.configure("TSpinbox", font=(family, size))
+
+    # ==================== 系统托盘 ====================
+
+    def _setup_tray(self):
+        self.root.protocol("WM_DELETE_WINDOW", self._on_window_close)
+
+    def _create_tray_icon(self):
+        """每次最小化时创建新的托盘图标"""
+        try:
+            import pystray
+            from PIL import Image
+
+            png_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "tray_icon.png")
+            ico_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "图片2.ico")
+            if os.path.exists(png_path):
+                image = Image.open(png_path)
+            elif os.path.exists(ico_path):
+                image = Image.open(ico_path).convert("RGBA").resize((64, 64), Image.LANCZOS)
+            else:
+                image = Image.new("RGB", (64, 64), "#4a90d9")
+
+            menu = pystray.Menu(
+                pystray.MenuItem("显示窗口", self._restore_from_tray, default=True),
+                pystray.MenuItem("重启", self._restart_app),
+                pystray.MenuItem("退出", self._exit_app)
+            )
+            return pystray.Icon("reminder", image, "日程提醒工具", menu)
+        except Exception as e:
+            print(f"托盘初始化失败: {e}")
+            return None
+
+    def _on_window_close(self):
+        if self.cfg.get("minimize_to_tray", False):
+            self._minimize_to_tray()
+        else:
+            self._exit_app()
+
+    def _minimize_to_tray(self):
+        self.tray_icon = self._create_tray_icon()
+        if self.tray_icon:
+            self.root.withdraw()
+            threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+    def _restore_from_tray(self, icon=None, item=None):
+        self.root.after(0, self._do_restore)
+
+    def _do_restore(self):
+        self.root.deiconify()
+        self.root.lift()
+
+    def _exit_app(self, icon=None, item=None):
+        if icon:
+            icon.stop()
+        elif self.tray_icon:
+            self.tray_icon.stop()
+        self.root.after(0, self.root.destroy)
+
+    def _restart_app(self, icon=None, item=None):
+        if icon:
+            icon.stop()
+        elif self.tray_icon:
+            self.tray_icon.stop()
+        self.root.after(0, self._do_restart)
+
+    def _do_restart(self):
+        import subprocess
+        script = os.path.abspath(sys.argv[0])
+        self.root.destroy()
+        subprocess.Popen([sys.executable, script])
+
+    # ==================== AI 助手 ====================
 
     def _build_ai_tab(self):
-        # 对话历史
+        # 对话历史（顶部，可扩展）
         history_frame = ttk.LabelFrame(self.frame_ai, text="对话历史", padding=6)
         history_frame.pack(fill="both", expand=True, padx=8, pady=(8, 4))
 
         self.chat_text = tk.Text(history_frame, height=15, wrap="word", state="disabled",
-                                 font=("微软雅黑", 9))
+                                 font=self._get_font())
         chat_scrollbar = ttk.Scrollbar(history_frame, orient="vertical", command=self.chat_text.yview)
         self.chat_text.configure(yscrollcommand=chat_scrollbar.set)
         self.chat_text.pack(side="left", fill="both", expand=True)
         chat_scrollbar.pack(side="left", fill="y")
 
-        # 配置标签样式
         self.chat_text.tag_configure("user", foreground="#0066cc")
         self.chat_text.tag_configure("assistant", foreground="#006600")
         self.chat_text.tag_configure("error", foreground="#cc0000")
-        self.chat_text.tag_configure("time", foreground="#888888", font=("微软雅黑", 8))
+        self.chat_text.tag_configure("time", foreground="#888888", font=self._get_font(12))
 
         # 清空历史按钮
-        btn_frame = ttk.Frame(history_frame)
-        btn_frame.pack(side="bottom", anchor="e", pady=(4, 0))
+        btn_frame = ttk.Frame(self.frame_ai)
+        btn_frame.pack(fill="x", padx=8, pady=(0, 4))
         ttk.Button(btn_frame, text="清空历史", command=self._clear_chat_history).pack(side="right")
 
-        # 输入区域
+        # 输入框 + 发送按钮（底部）
         input_frame = ttk.Frame(self.frame_ai)
         input_frame.pack(fill="x", padx=8, pady=(0, 8))
 
-        self.ai_input = tk.Text(input_frame, height=3, wrap="word", font=("微软雅黑", 9))
+        self.ai_input = tk.Text(input_frame, height=3, wrap="word", font=self._get_font())
         self.ai_input.pack(side="left", fill="both", expand=True, padx=(0, 6))
         self.ai_input.bind("<Return>", self._on_ai_enter)
-        self.ai_input.bind("<Shift-Return>", lambda e: None)  # Shift+Enter 换行
+        self.ai_input.bind("<Shift-Return>", lambda e: None)
 
         self.btn_send = ttk.Button(input_frame, text="发送", command=self._send_ai_message)
-        self.btn_send.pack(side="right")
+        self.btn_send.pack(side="right", fill="y")
 
     def _on_ai_enter(self, event):
-        # Enter 发送，Shift+Enter 换行
-        if not event.state & 0x1:  # 没有按 Shift
+        if not event.state & 0x1:
             self._send_ai_message()
-            return "break"  # 阻止默认换行
+            return "break"
 
     def _load_chat_history(self):
         data = load_history()
         self.chat_text.config(state="normal")
         self.chat_text.delete("1.0", "end")
         for entry in data["history"]:
-            time_str = entry["time"].split(" ")[1][:5]  # 只显示时:分
+            time_str = entry["time"].split(" ")[1][:5]
             role = entry["role"]
             content = entry["content"]
             if role == "user":
@@ -248,190 +248,32 @@ class ReminderApp:
         if not user_input:
             return
 
-        # 检查 API Key
         if not self.cfg.get("ai_api_key"):
             messagebox.showwarning("提示", "请先在设置中配置 AI API Key")
             return
 
-        # 清空输入框
         self.ai_input.delete("1.0", "end")
-
-        # 显示用户消息
         self._append_chat("user", user_input)
         add_history("user", user_input)
 
-        # 显示加载状态
         self.ai_loading = True
         self.btn_send.config(state="disabled")
         self.ai_input.insert("1.0", "AI 思考中...")
         self.ai_input.config(state="disabled")
 
-        # 在新线程调用 API
         threading.Thread(target=self._call_ai_api, args=(user_input,), daemon=True).start()
 
     def _call_ai_api(self, user_input):
-        import requests
-
-        provider_id = self.cfg.get("ai_provider", "zhipu")
-        provider = AI_PROVIDERS.get(provider_id)
-        if not provider:
-            self.root.after(0, self._ai_error, "未知的 AI 服务商")
-            return
-
-        api_key = self.cfg["ai_api_key"]
-        model = self.cfg.get("ai_model", provider["default_model"])
-        base_url = provider["base_url"]
-
-        today = date.today()
-        today_str = today.strftime("%Y-%m-%d")
-        weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-        today_weekday = weekday_names[today.weekday()]
-        today_weekday_num = today.weekday()
-        system_prompt = f"""你是日程解析助手。将用户的自然语言输入解析为 JSON。
-
-当前日期：{today_str}（{today_weekday}，weekday={today_weekday_num}）
-
-日期计算规则：
-- "下周五" 指的是下周的周五，不是本周
-- "下周" 是指从下周一到下周日
-- "大后天" 是今天+3天，"后天" 是今天+2天，"明天" 是今天+1天
-- weekday: 0=周一, 1=周二, 2=周三, 3=周四, 4=周五, 5=周六, 6=周日
-
-重要：计算星期几的方法
-给定一个日期，用 (日期 - 当前日期) % 7 + 当前weekday 来计算
-例如：今天是2026-05-08（weekday=4），5月10号是(10-8)%7+4=6=周日
-
-输出格式（只输出 JSON，不要其他内容）：
-
-单日事件：
-{{
-  "name": "事项名称",
-  "type": "exam/class/training/other",
-  "date": "YYYY-MM-DD",
-  "location": "地点"
-}}
-
-多日周期事件（如每周六的实验课）：
-{{
-  "name": "事项名称",
-  "type": "training/class/other",
-  "start": "YYYY-MM-DD",
-  "end": "YYYY-MM-DD",
-  "location": "地点",
-  "schedule": [
-    {{"day": "周六", "period": "全天", "location": "地点"}}
-  ]
-}}
-
-注意：
-- 只包含用户明确提到的字段，没提到的不要包含
-- 如果用户没指定类型，根据语境推断（考试→exam，上课→class，实训→training）
-- 如果用户给出多个日期，先计算每个日期是星期几
-- 如果都是同一天（如都是周日），则只生成一个 schedule 条目
-- schedule 只需包含不重复的星期几
-- schedule 中的 day 用中文（周一~周日），period 用 1-4/5-8/evening/全天
-- 只输出 JSON，不要有其他文字"""
-
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
-        }
-
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_input}
-            ],
-            "temperature": 0.1
-        }
-
-        try:
-            resp = requests.post(base_url, headers=headers, json=payload, timeout=30)
-            resp.raise_for_status()
-            result = resp.json()
-
-            # 提取 AI 回复
-            ai_content = result["choices"][0]["message"]["content"].strip()
-
-            # 解析 JSON
-            try:
-                # 尝试提取 JSON（可能被 markdown 包裹）
-                if "```" in ai_content:
-                    json_str = ai_content.split("```")[1]
-                    if json_str.startswith("json"):
-                        json_str = json_str[4:]
-                else:
-                    json_str = ai_content
-
-                event_data = json.loads(json_str.strip())
-
-                # 确保有 name 字段
-                if "name" not in event_data:
-                    self.root.after(0, self._ai_error, "AI 返回的数据缺少事项名称")
-                    return
-
-                # 后处理：修正日期格式
-                for date_field in ["date", "start", "end"]:
-                    if date_field in event_data:
-                        try:
-                            d = datetime.strptime(str(event_data[date_field]), "%Y-%m-%d")
-                            event_data[date_field] = d.strftime("%Y-%m-%d")
-                        except ValueError:
-                            pass
-
-                # 后处理：修正 schedule 中的 day 和去重
-                if "schedule" in event_data and "start" in event_data:
-                    try:
-                        start_date = datetime.strptime(event_data["start"], "%Y-%m-%d").date()
-                        weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-                        seen = set()
-                        unique_schedule = []
-                        for entry in event_data["schedule"]:
-                            # 根据 start 日期计算正确的星期几
-                            entry["day"] = weekday_names[start_date.weekday()]
-                            key = (entry.get("day"), entry.get("period"))
-                            if key not in seen:
-                                seen.add(key)
-                                unique_schedule.append(entry)
-                        event_data["schedule"] = unique_schedule
-                    except ValueError:
-                        pass
-
-                # 转换日期格式并过滤空字段
-                cleaned_data = {}
-                for key, val in event_data.items():
-                    if val is None or val == "":
-                        continue
-                    if key in ["date", "start", "end"]:
-                        cleaned_data[key] = str(val)
-                    else:
-                        cleaned_data[key] = val
-                event_data = cleaned_data
-
-                self.root.after(0, self._ai_success, user_input, event_data)
-
-            except json.JSONDecodeError:
-                self.root.after(0, self._ai_error, f"AI 返回格式错误：\n{ai_content}")
-
-        except requests.exceptions.Timeout:
-            self.root.after(0, self._ai_error, "请求超时，请检查网络后重试")
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 401:
-                self.root.after(0, self._ai_error, "API Key 无效，请检查设置")
-            elif e.response.status_code == 429:
-                self.root.after(0, self._ai_error, "API 余额不足或请求过于频繁")
-            else:
-                self.root.after(0, self._ai_error, f"请求失败：{e}")
-        except Exception as e:
-            self.root.after(0, self._ai_error, f"发生错误：{e}")
+        event_data, error_msg = call_ai_api(self.cfg, user_input)
+        if error_msg:
+            self.root.after(0, self._ai_error, error_msg)
+        else:
+            self.root.after(0, self._ai_success, user_input, event_data)
 
     def _ai_success(self, user_input, event_data):
         self._reset_ai_input()
         self._append_chat("assistant", f"已解析事件「{event_data.get('name', '')}」，请确认")
         add_history("assistant", f"已创建事件「{event_data.get('name', '')}」", event=event_data)
-
-        # 弹出编辑框让用户确认
         EventDialog(self.root, "AI 解析结果（请确认或修改）", reminder=event_data,
                     callback=self._save_new_event)
 
@@ -446,10 +288,9 @@ class ReminderApp:
         self.ai_input.config(state="normal")
         self.ai_input.delete("1.0", "end")
 
-    # ---------- 事件列表 ----------
+    # ==================== 事件列表 ====================
 
     def _build_events_tab(self):
-        # 复选框图标
         self.checked = "☑"
         self.unchecked = "☐"
 
@@ -462,7 +303,7 @@ class ReminderApp:
         self.tree.heading("week", text="周次")
         self.tree.heading("location", text="地点")
         self.tree.column("#0", width=200)
-        self.tree.column("status", width=40, anchor="center")
+        self.tree.column("status", width=60, anchor="center")
         self.tree.column("type", width=60, anchor="center")
         self.tree.column("date", width=110)
         self.tree.column("week", width=100)
@@ -473,13 +314,9 @@ class ReminderApp:
         self.tree.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
         scrollbar.pack(side="left", fill="y", pady=6, padx=(0, 6))
 
-        # 样式
         self.tree.tag_configure("completed", foreground="gray")
-
-        # 点击复选框
         self.tree.bind("<Button-1>", self._on_tree_click)
 
-        # 右键菜单
         self.ctx_menu = tk.Menu(self.tree, tearoff=0)
         self.ctx_menu.add_command(label="添加", command=self._add_event)
         self.ctx_menu.add_command(label="编辑", command=self._edit_event)
@@ -492,7 +329,7 @@ class ReminderApp:
     def _load_events(self):
         for item in self.tree.get_children():
             self.tree.delete(item)
-        self._rem_index_map = {}  # tree_item_id → reminder_index
+        self._rem_index_map = {}
         try:
             data = load_yaml(self.cfg["yaml_path"])
         except FileNotFoundError:
@@ -502,25 +339,19 @@ class ReminderApp:
             messagebox.showerror("错误", f"读取 YAML 失败：{e}")
             return
 
-        # 自动标记超时事件
-        self._auto_complete_timeout(data)
+        auto_complete_timeout(self.cfg, data)
+        regenerate_reminders(self.cfg, data)
 
-        # 为缺少提醒点的事件自动生成
-        self._regenerate_reminders(data)
-
-        SEMESTER_START = date(2026, 3, 2)
         WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
         weekday_map = {"周一": 0, "周二": 1, "周三": 2, "周四": 3, "周五": 4, "周六": 5, "周日": 6}
         type_labels = {"exam": "考试", "class": "上课", "training": "实训", "other": "其他"}
         period_labels = {"1-4": "1~4节", "5-8": "5~8节", "evening": "晚课", "全天": "全天"}
 
         def calc_week(d):
-            """从日期计算 第N周周X"""
             week_num = (d - SEMESTER_START).days // 7 + 1
             return f"第{week_num}周{WEEKDAY_NAMES[d.weekday()]}"
 
         def get_sort_key(rem):
-            """获取排序用的日期，没有日期的排最后"""
             if "date" in rem:
                 try:
                     return datetime.strptime(str(rem["date"]), "%Y-%m-%d").date()
@@ -540,7 +371,6 @@ class ReminderApp:
             return date.max
 
         def get_completed_time(rem):
-            """获取完成时间，用于已完成事件排序"""
             completed_at = rem.get("completed_at", "")
             if completed_at:
                 try:
@@ -549,65 +379,69 @@ class ReminderApp:
                     pass
             return datetime.min
 
-        # 分组：未完成和已完成
         reminders = data.get("reminders", [])
-        pending = [(idx, rem) for idx, rem in enumerate(reminders) if not rem.get("completed")]
-        completed = [(idx, rem) for idx, rem in enumerate(reminders) if rem.get("completed")]
 
-        # 未完成：按日期正序（最近的在最上面）
+        # 分离：普通事件按 completed 分组，多日部分完成事件两边都显示
+        pending = []
+        completed = []
+        partial_events = []  # (idx, rem) 多日任务且部分完成
+
+        for idx, rem in enumerate(reminders):
+            has_schedule = "schedule" in rem and "start" in rem and "end" in rem
+            sub_items = rem.get("sub_items", {})
+            if has_schedule and sub_items:
+                done = sum(1 for v in sub_items.values() if v.get("completed"))
+                total = len(sub_items)
+                if 0 < done < total:
+                    partial_events.append((idx, rem))
+                    continue
+            if rem.get("completed"):
+                completed.append((idx, rem))
+            else:
+                pending.append((idx, rem))
+
         pending_sorted = sorted(pending, key=lambda x: get_sort_key(x[1]))
-
-        # 已完成：按完成时间顺序（最近完成的在最上面）
         completed_sorted = sorted(completed, key=lambda x: get_completed_time(x[1]), reverse=True)
 
-        # 创建未完成分组
-        pending_count = len(pending_sorted)
+        # 未完成分组
+        pending_count = len(pending_sorted) + len(partial_events)
         pending_parent = self.tree.insert("", "end", text=f"未完成 ({pending_count})", open=True)
-        self._rem_index_map[pending_parent] = -1  # 标记为分组节点
+        self._rem_index_map[pending_parent] = (-1, None)
 
         for idx, rem in pending_sorted:
             self._insert_reminder(pending_parent, idx, rem, type_labels, period_labels,
                                   calc_week, weekday_map, completed=False)
+        for idx, rem in partial_events:
+            self._insert_reminder(pending_parent, idx, rem, type_labels, period_labels,
+                                  calc_week, weekday_map, completed=False, filter_sub="pending")
 
-        # 创建已完成分组
-        completed_count = len(completed_sorted)
+        # 已完成分组
+        completed_count = len(completed_sorted) + len(partial_events)
         completed_parent = self.tree.insert("", "end", text=f"已完成 ({completed_count})", open=True)
-        self._rem_index_map[completed_parent] = -1  # 标记为分组节点
+        self._rem_index_map[completed_parent] = (-1, None)
 
         for idx, rem in completed_sorted:
             self._insert_reminder(completed_parent, idx, rem, type_labels, period_labels,
                                   calc_week, weekday_map, completed=True)
+        for idx, rem in partial_events:
+            self._insert_reminder(completed_parent, idx, rem, type_labels, period_labels,
+                                  calc_week, weekday_map, completed=True, filter_sub="completed")
 
-    def _insert_reminder(self, parent, idx, rem, type_labels, period_labels, calc_week, weekday_map, completed):
-        """插入单个事件到树中"""
+    def _insert_reminder(self, parent, idx, rem, type_labels, period_labels, calc_week, weekday_map, completed, filter_sub=None):
         name = rem.get("name", "")
         rtype = type_labels.get(rem.get("type", ""), rem.get("type", ""))
         loc = rem.get("location", "")
         status = self.checked if completed else self.unchecked
         tags = ("completed",) if completed else ()
 
-        # 格式化完成时间
-        completed_str = ""
-        if completed and rem.get("completed_at"):
-            try:
-                dt = datetime.strptime(rem["completed_at"], "%Y-%m-%d %H:%M:%S")
-                completed_str = f"完成于 {dt.strftime('%m-%d')}"
-            except ValueError:
-                pass
-
-        # 有 schedule 的多日事件
+        # 多日事件 — 子项可独立完成
         if "schedule" in rem and "start" in rem and "end" in rem:
             start = to_date_str(rem["start"])
             end = to_date_str(rem["end"])
             week = rem.get("week", "")
-            date_display = f"{start} ~ {end}"
-            if completed_str:
-                date_display += f"  {completed_str}"
-            parent_id = self.tree.insert(parent, "end", text=name,
-                                         values=(status, rtype, date_display, week, loc),
-                                         tags=tags)
-            self._rem_index_map[parent_id] = idx
+            sub_items = rem.get("sub_items", {})
 
+            all_dates = []
             try:
                 start_d = datetime.strptime(start, "%Y-%m-%d").date()
                 end_d = datetime.strptime(end, "%Y-%m-%d").date()
@@ -616,23 +450,61 @@ class ReminderApp:
 
             for entry in rem.get("schedule", []):
                 entry_wd = weekday_map.get(entry.get("day"))
-                period = entry.get("period", "全天")
-                entry_loc = entry.get("location", loc)
-                period_label = period_labels.get(period, period)
-
                 if entry_wd is not None:
                     d = start_d
                     while d <= end_d:
                         if d.weekday() == entry_wd:
-                            child_id = self.tree.insert(
-                                parent_id, "end",
-                                text=f"{entry['day']} {period_label}",
-                                values=("", "", d.strftime("%Y-%m-%d"), calc_week(d), entry_loc),
-                                tags=tags)
-                            self._rem_index_map[child_id] = idx
+                            all_dates.append((d, entry))
                         d += timedelta(days=1)
+
+            # 按 filter_sub 过滤子项
+            if filter_sub == "pending":
+                filtered = [(d, e) for d, e in all_dates if not sub_items.get(str(d), {}).get("completed")]
+            elif filter_sub == "completed":
+                filtered = [(d, e) for d, e in all_dates if sub_items.get(str(d), {}).get("completed")]
+            else:
+                filtered = all_dates
+
+            if not filtered:
+                return
+
+            done_count = sum(1 for d, _ in all_dates if sub_items.get(str(d), {}).get("completed"))
+            total_count = len(all_dates)
+            if filter_sub:
+                parent_status = self.checked if completed else self.unchecked
+                parent_tags = ("completed",) if completed else ()
+            elif total_count > 0 and done_count == total_count:
+                parent_status = self.checked
+                parent_tags = ("completed",)
+            elif done_count > 0:
+                parent_status = f"[{done_count}/{total_count}]"
+                parent_tags = ()
+            else:
+                parent_status = self.unchecked
+                parent_tags = ()
+
+            date_display = f"{start} ~ {end}"
+            parent_id = self.tree.insert(parent, "end", text=name,
+                                         values=(parent_status, rtype, date_display, week, loc),
+                                         tags=parent_tags)
+            self._rem_index_map[parent_id] = (idx, None)
+
+            for d, entry in filtered:
+                period = entry.get("period", "全天")
+                entry_loc = entry.get("location", loc)
+                period_label = period_labels.get(period, period)
+                date_str = d.strftime("%Y-%m-%d")
+                sub = sub_items.get(date_str, {})
+                sub_done = sub.get("completed", False)
+                sub_status = self.checked if sub_done else self.unchecked
+                sub_tags = ("completed",) if sub_done else ()
+                child_id = self.tree.insert(
+                    parent_id, "end",
+                    text=f"{entry['day']} {period_label}",
+                    values=(sub_status, "", date_str, calc_week(d), entry_loc),
+                    tags=sub_tags)
+                self._rem_index_map[child_id] = (idx, date_str)
         else:
-            # 单日 / 仅周次事件
             date_str = ""
             week_str = rem.get("week", "")
             if "date" in rem:
@@ -643,82 +515,91 @@ class ReminderApp:
                         week_str = calc_week(d)
                     except ValueError:
                         pass
-            if completed_str:
-                date_str += f"  {completed_str}"
             item_id = self.tree.insert(parent, "end", text=name,
                                        values=(status, rtype, date_str, week_str, loc),
                                        tags=tags)
-            self._rem_index_map[item_id] = idx
-
-    def _auto_complete_timeout(self, data):
-        """自动标记超时12小时的事件"""
-        now = datetime.now()
-        changed = False
-
-        for rem in data.get("reminders", []):
-            if rem.get("completed"):
-                continue
-
-            event_date = rem.get("date") or rem.get("start")
-            if not event_date:
-                continue
-
-            try:
-                event_dt = datetime.strptime(str(event_date), "%Y-%m-%d")
-                if (now - event_dt).total_seconds() > 12 * 3600:
-                    rem["completed"] = True
-                    rem["completed_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
-                    changed = True
-            except ValueError:
-                pass
-
-        if changed:
-            save_yaml(self.cfg["yaml_path"], data)
-
-    def _regenerate_reminders(self, data):
-        """为缺少提醒点的事件自动生成（迁移旧数据）"""
-        changed = False
-        for rem in data.get("reminders", []):
-            if "reminders" not in rem:
-                self._generate_reminders(rem)
-                changed = True
-        if changed:
-            save_yaml(self.cfg["yaml_path"], data)
+            self._rem_index_map[item_id] = (idx, None)
 
     def _on_tree_click(self, event):
-        """点击复选框切换完成状态"""
         region = self.tree.identify_region(event.x, event.y)
         if region != "cell":
             return
-
         column = self.tree.identify_column(event.x)
         item = self.tree.identify_row(event.y)
-
-        # 点击状态列（#1）或名称列（#0）
         if column not in ("#1", "#0"):
             return
+        info = self._rem_index_map.get(item)
+        if info is None:
+            return
+        idx, sub_date = info
+        if idx < 0:
+            return
+        self._toggle_complete(idx, sub_date)
 
-        # 获取事件索引
-        idx = self._rem_index_map.get(item)
-        if idx is None or idx < 0:
-            return  # 分组节点，忽略
+    @staticmethod
+    def _get_all_scheduled_dates(rem):
+        """获取多日事件所有应出现的日期集合"""
+        weekday_map = {"周一": 0, "周二": 1, "周三": 2, "周四": 3, "周五": 4, "周六": 5, "周日": 6}
+        if "schedule" not in rem or "start" not in rem or "end" not in rem:
+            return set()
+        try:
+            start_d = datetime.strptime(to_date_str(rem["start"]), "%Y-%m-%d").date()
+            end_d = datetime.strptime(to_date_str(rem["end"]), "%Y-%m-%d").date()
+        except ValueError:
+            return set()
+        dates = set()
+        for entry in rem.get("schedule", []):
+            entry_wd = weekday_map.get(entry.get("day"))
+            if entry_wd is not None:
+                d = start_d
+                while d <= end_d:
+                    if d.weekday() == entry_wd:
+                        dates.add(str(d))
+                    d += timedelta(days=1)
+        return dates
 
-        # 切换完成状态
-        self._toggle_complete(idx)
-
-    def _toggle_complete(self, idx):
-        """切换事件的完成状态"""
+    def _toggle_complete(self, idx, sub_date=None):
         data = load_yaml(self.cfg["yaml_path"])
         rem = data["reminders"][idx]
 
-        if rem.get("completed"):
-            # 撤销完成
-            rem["completed"] = False
-            rem.pop("completed_at", None)
+        if sub_date:
+            sub_items = rem.setdefault("sub_items", {})
+            sub = sub_items.setdefault(sub_date, {})
+            if sub.get("completed"):
+                sub["completed"] = False
+                sub.pop("completed_at", None)
+            else:
+                sub["completed"] = True
+                sub["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # 检查所有应出现的日期是否都已完成（而非仅检查已有条目）
+            all_dates = self._get_all_scheduled_dates(rem)
+            if all_dates:
+                all_done = all(sub_items.get(d, {}).get("completed") for d in all_dates)
+            else:
+                all_done = all(v.get("completed") for v in sub_items.values()) if sub_items else False
+            if all_done and not rem.get("completed"):
+                rem["completed"] = True
+                rem["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            elif not all_done and rem.get("completed"):
+                rem["completed"] = False
+                rem.pop("completed_at", None)
         else:
-            # 标记完成
-            rem["completed"] = True
-            rem["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            all_dates = self._get_all_scheduled_dates(rem)
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if rem.get("completed"):
+                rem["completed"] = False
+                rem.pop("completed_at", None)
+                for sub in rem.get("sub_items", {}).values():
+                    sub["completed"] = False
+                    sub.pop("completed_at", None)
+            else:
+                rem["completed"] = True
+                rem["completed_at"] = now_str
+                sub_items = rem.setdefault("sub_items", {})
+                for d in all_dates:
+                    sub = sub_items.setdefault(d, {})
+                    sub["completed"] = True
+                    sub["completed_at"] = now_str
 
         save_yaml(self.cfg["yaml_path"], data)
         self._load_events()
@@ -734,8 +615,12 @@ class ReminderApp:
         if not sel:
             messagebox.showinfo("提示", "请先选择一条事件")
             return None
-        idx = self._rem_index_map.get(sel[0])
-        if idx is None or idx < 0:
+        info = self._rem_index_map.get(sel[0])
+        if info is None:
+            messagebox.showinfo("提示", "请先选择一条事件")
+            return None
+        idx, sub_date = info
+        if idx < 0:
             messagebox.showinfo("提示", "请先选择一条事件")
             return None
         return idx
@@ -744,7 +629,7 @@ class ReminderApp:
         EventDialog(self.root, "添加事件", callback=self._save_new_event)
 
     def _save_new_event(self, rem):
-        self._generate_reminders(rem)
+        generate_reminders(rem)
         data = load_yaml(self.cfg["yaml_path"])
         data.setdefault("reminders", []).append(rem)
         save_yaml(self.cfg["yaml_path"], data)
@@ -760,7 +645,7 @@ class ReminderApp:
                     callback=lambda r: self._save_edited_event(idx, r))
 
     def _save_edited_event(self, idx, rem):
-        self._generate_reminders(rem)
+        generate_reminders(rem)
         data = load_yaml(self.cfg["yaml_path"])
         data["reminders"][idx] = rem
         save_yaml(self.cfg["yaml_path"], data)
@@ -786,7 +671,6 @@ class ReminderApp:
         rem = data["reminders"][idx]
         name = rem.get("name", "")
 
-        # 构造提醒内容
         parts = [f"事项：{name}"]
         if rem.get("location"):
             parts.append(f"地点：{rem['location']}")
@@ -803,17 +687,17 @@ class ReminderApp:
             parts.append("安排：\n" + "\n".join(schedule_lines))
         message = "\n".join(parts)
 
-        # 桌面通知
-        try:
-            from plyer import notification
-            notification.notify(title=f"日程提醒：{name}", message=message, timeout=10)
-            desktop_ok = True
-        except Exception as e:
-            desktop_ok = False
-            messagebox.showerror("桌面通知失败", str(e))
+        desktop_ok = False
+        if self.cfg.get("enable_desktop", True):
+            desktop_ok = send_desktop(f"日程提醒：{name}", message)
+            if not desktop_ok:
+                messagebox.showerror("桌面通知失败", "请检查 plyer 是否安装")
 
-        # 邮件通知
-        email_ok = self._send_email(f"日程提醒：{name}", message)
+        email_ok = False
+        if self.cfg.get("enable_email", True):
+            email_ok = send_email(self.cfg, f"日程提醒：{name}", message)
+            if not email_ok:
+                messagebox.showerror("邮件发送失败", "请检查邮件配置")
 
         if desktop_ok and email_ok:
             messagebox.showinfo("测试推送", f"桌面通知和邮件已发送\n\n{message}")
@@ -822,224 +706,49 @@ class ReminderApp:
         elif email_ok:
             messagebox.showwarning("测试推送", f"邮件已发送，桌面通知失败\n\n{message}")
 
-    def _send_email(self, title, content):
-        import smtplib
-        from email.mime.text import MIMEText
-        try:
-            msg = MIMEText(content, "plain", "utf-8")
-            msg["From"] = self.cfg["sender_email"]
-            msg["To"] = self.cfg["receiver_email"]
-            msg["Subject"] = title
-            with smtplib.SMTP_SSL(self.cfg["smtp_server"], int(self.cfg["smtp_port"])) as server:
-                server.login(self.cfg["sender_email"], self.cfg["sender_password"])
-                server.sendmail(self.cfg["sender_email"], self.cfg["receiver_email"], msg.as_string())
-            return True
-        except Exception as e:
-            messagebox.showerror("邮件发送失败", str(e))
-            return False
-
-    def _send_email_silent(self, title, content):
-        """静默发送邮件，不弹窗"""
-        import smtplib
-        from email.mime.text import MIMEText
-        try:
-            msg = MIMEText(content, "plain", "utf-8")
-            msg["From"] = self.cfg["sender_email"]
-            msg["To"] = self.cfg["receiver_email"]
-            msg["Subject"] = title
-            with smtplib.SMTP_SSL(self.cfg["smtp_server"], int(self.cfg["smtp_port"])) as server:
-                server.login(self.cfg["sender_email"], self.cfg["sender_password"])
-                server.sendmail(self.cfg["sender_email"], self.cfg["receiver_email"], msg.as_string())
-            return True
-        except Exception:
-            return False
-
-    def _generate_reminders(self, rem):
-        """根据事件精度自动生成提醒时间点"""
-        period_hours = {"1-4": 6, "5-8": 10, "evening": 14, "全天": 7}
-        reminders = []
-
-        # 已完成事件不生成提醒
-        if rem.get("completed"):
-            rem["reminders"] = []
-            return
-
-        # 只有周次
-        if "week" in rem and "date" not in rem and "start" not in rem:
-            try:
-                week_num = int(rem["week"].replace("第", "").replace("周", ""))
-                week_monday = SEMESTER_START + timedelta(weeks=week_num - 1)
-                prev_monday = week_monday - timedelta(days=7)
-                prev_sunday = week_monday - timedelta(days=1)
-                reminders.append({"time": f"{prev_monday} 20:00", "sent": False})
-                reminders.append({"time": f"{prev_sunday} 20:00", "sent": False})
-            except ValueError:
-                pass
-
-        # 具体日期（单日）
-        elif "date" in rem:
-            try:
-                event_date = datetime.strptime(str(rem["date"]), "%Y-%m-%d")
-                day_before = event_date - timedelta(days=1)
-                reminders.append({"time": day_before.strftime("%Y-%m-%d") + " 20:00", "sent": False})
-                time_val = rem.get("time", "全天")
-                hour = period_hours.get(time_val, 7)
-                reminders.append({"time": event_date.strftime("%Y-%m-%d") + f" {hour:02d}:00", "sent": False})
-            except ValueError:
-                pass
-
-        # 多日周期事件
-        elif "start" in rem and "end" in rem:
-            try:
-                start_dt = datetime.strptime(str(rem["start"]), "%Y-%m-%d")
-                end_dt = datetime.strptime(str(rem["end"]), "%Y-%m-%d")
-                day_before = start_dt - timedelta(days=1)
-                reminders.append({"time": day_before.strftime("%Y-%m-%d") + " 20:00", "sent": False})
-                d = start_dt
-                while d <= end_dt:
-                    if d.weekday() == 0:  # 周一
-                        reminders.append({"time": d.strftime("%Y-%m-%d") + " 07:30", "sent": False})
-                    d += timedelta(days=1)
-            except ValueError:
-                pass
-
-        rem["reminders"] = reminders
-
-    def _send_startup_reminder(self):
-        """启动时发送今天和明天的未完成任务汇总"""
-        try:
-            data = load_yaml(self.cfg["yaml_path"])
-        except Exception:
-            return
-
-        today = date.today()
-        tomorrow = today + timedelta(days=1)
-        today_str = today.strftime("%Y-%m-%d")
-        tomorrow_str = tomorrow.strftime("%Y-%m-%d")
-
-        today_tasks = []
-        tomorrow_tasks = []
-        period_labels = {"1-4": "1~4节", "5-8": "5~8节", "evening": "晚课", "全天": "全天"}
-
-        for rem in data.get("reminders", []):
-            if rem.get("completed"):
-                continue
-            event_date = rem.get("date") or rem.get("start")
-            if not event_date:
-                continue
-            event_date_str = str(event_date)
-            name = rem.get("name", "")
-            loc = rem.get("location", "")
-            time_val = rem.get("time", "")
-            time_label = period_labels.get(time_val, time_val) if time_val else ""
-            week = rem.get("week", "")
-            parts = [f"  - {name}"]
-            if loc:
-                parts.append(f"地点: {loc}")
-            if time_label:
-                parts.append(f"时间: {time_label}")
-            elif week:
-                parts.append(f"周次: {week}")
-            line = "  ".join(parts)
-            if event_date_str == today_str:
-                today_tasks.append(line)
-            elif event_date_str == tomorrow_str:
-                tomorrow_tasks.append(line)
-
-        if not today_tasks and not tomorrow_tasks:
-            return
-
-        lines = ["日程提醒启动报告", ""]
-        if today_tasks:
-            lines.append(f"【今日任务 {today_str}】")
-            lines.extend(today_tasks)
-            lines.append("")
-        if tomorrow_tasks:
-            lines.append(f"【明日任务 {tomorrow_str}】")
-            lines.extend(tomorrow_tasks)
-        lines.append("")
-        lines.append("此邮件由日程提醒工具自动发送")
-
-        message = "\n".join(lines)
-        self._send_email_silent(f"日程提醒：今日{len(today_tasks)}项 明日{len(tomorrow_tasks)}项", message)
-
-    def _start_reminder_checker(self):
-        """启动定时提醒检查线程（每60秒检查一次）"""
-        import threading
-        threading.Thread(target=self._reminder_checker_loop, daemon=True).start()
-
-    def _reminder_checker_loop(self):
-        """定时提醒检查循环"""
-        import time
-        while True:
-            time.sleep(60)
-            try:
-                self._check_due_reminders()
-            except Exception:
-                pass
-
-    def _check_due_reminders(self):
-        """检查并发送到期的定时提醒"""
-        try:
-            data = load_yaml(self.cfg["yaml_path"])
-        except Exception:
-            return
-
-        now = datetime.now()
-        now_str = now.strftime("%Y-%m-%d %H:%M")
-        changed = False
-        period_labels = {"1-4": "1~4节", "5-8": "5~8节", "evening": "晚课", "全天": "全天"}
-
-        for rem in data.get("reminders", []):
-            if not rem.get("reminders"):
-                continue
-            for reminder in rem["reminders"]:
-                if reminder.get("sent"):
-                    continue
-                reminder_time = reminder.get("time", "")
-                if reminder_time == now_str:
-                    name = rem.get("name", "")
-                    loc = rem.get("location", "")
-                    event_date = rem.get("date") or rem.get("start") or ""
-                    time_val = rem.get("time", "")
-                    time_label = period_labels.get(time_val, time_val) if time_val else ""
-                    week = rem.get("week", "")
-                    parts = [f"事项：{name}"]
-                    if loc:
-                        parts.append(f"地点：{loc}")
-                    if event_date:
-                        parts.append(f"日期：{event_date}")
-                    if time_label:
-                        parts.append(f"时段：{time_label}")
-                    elif week:
-                        parts.append(f"周次：{week}")
-                    parts.append("\n此邮件由日程提醒工具自动发送")
-                    message = "\n".join(parts)
-                    self._send_email_silent(f"日程提醒：{name}", message)
-                    reminder["sent"] = True
-                    changed = True
-
-        if changed:
-            save_yaml(self.cfg["yaml_path"], data)
-
-    # ---------- 设置页 ----------
+    # ==================== 设置页 ====================
 
     def _build_settings_tab(self):
-        # 创建可滚动的画布
-        canvas = tk.Canvas(self.frame_settings)
-        scrollbar = ttk.Scrollbar(self.frame_settings, orient="vertical", command=canvas.yview)
+        # 可滚动画布 + 居中容器
+        container = ttk.Frame(self.frame_settings)
+        container.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(container)
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
         scrollable_frame = ttk.Frame(canvas)
-
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="n")
         canvas.configure(yscrollcommand=scrollbar.set)
-
-        canvas.pack(side="left", fill="both", expand=True, padx=12, pady=12)
+        canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+
+        # 窗口宽度变化时居中内容
+        def _on_canvas_resize(event):
+            canvas.itemconfig(canvas_window, width=event.width)
+        canvas.bind("<Configure>", _on_canvas_resize)
+
+        # 绑定鼠标滚轮
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        # 字体设置
+        font_frame = ttk.LabelFrame(scrollable_frame, text="字体设置", padding=12)
+        font_frame.pack(fill="x", padx=20, pady=(12, 12))
+
+        ttk.Label(font_frame, text="字体").grid(row=0, column=0, sticky="e", padx=(0, 8), pady=4)
+        self.font_family_var = tk.StringVar(value=self.cfg.get("font_family", "微软雅黑"))
+        font_families = ["微软雅黑", "宋体", "黑体", "Arial", "Consolas"]
+        ttk.Combobox(font_frame, textvariable=self.font_family_var, values=font_families,
+                     width=20).grid(row=0, column=1, sticky="w", pady=4)
+
+        ttk.Label(font_frame, text="字号").grid(row=1, column=0, sticky="e", padx=(0, 8), pady=4)
+        self.font_size_var = tk.StringVar(value=str(self.cfg.get("font_size", 14)))
+        ttk.Spinbox(font_frame, textvariable=self.font_size_var, from_=8, to=36,
+                    width=8).grid(row=1, column=1, sticky="w", pady=4)
+
+        ttk.Button(font_frame, text="保存字体设置", command=self._save_font_settings).grid(
+            row=2, column=0, columnspan=2, pady=(8, 0))
 
         # 邮件配置
         mail_frame = ttk.LabelFrame(scrollable_frame, text="邮件配置", padding=12)
@@ -1069,11 +778,28 @@ class ReminderApp:
         ttk.Button(mail_btn_frame, text="保存设置", command=self._save_settings).pack(side="left", padx=4)
         ttk.Button(mail_btn_frame, text="测试邮件", command=self._test_email).pack(side="left", padx=4)
 
+        # 通知方式
+        notify_frame = ttk.LabelFrame(scrollable_frame, text="通知方式", padding=12)
+        notify_frame.pack(fill="x", padx=0, pady=(0, 12))
+
+        self.enable_email_var = tk.BooleanVar(value=self.cfg.get("enable_email", True))
+        self.enable_desktop_var = tk.BooleanVar(value=self.cfg.get("enable_desktop", True))
+        self.minimize_to_tray_var = tk.BooleanVar(value=self.cfg.get("minimize_to_tray", False))
+
+        ttk.Checkbutton(notify_frame, text="启用邮件通知", variable=self.enable_email_var).grid(
+            row=0, column=0, sticky="w", pady=4)
+        ttk.Checkbutton(notify_frame, text="启用桌面通知", variable=self.enable_desktop_var).grid(
+            row=1, column=0, sticky="w", pady=4)
+        ttk.Checkbutton(notify_frame, text="最小化到系统托盘", variable=self.minimize_to_tray_var).grid(
+            row=2, column=0, sticky="w", pady=4)
+
+        ttk.Button(notify_frame, text="保存通知设置", command=self._save_notify_settings).grid(
+            row=3, column=0, pady=(8, 0))
+
         # AI 配置
         ai_frame = ttk.LabelFrame(scrollable_frame, text="AI 配置", padding=12)
         ai_frame.pack(fill="x", padx=0, pady=(0, 12))
 
-        # AI 服务商
         ttk.Label(ai_frame, text="AI 服务商").grid(row=0, column=0, sticky="e", padx=(0, 8), pady=4)
         self.ai_provider_var = tk.StringVar(value=self.cfg.get("ai_provider", "zhipu"))
         provider_names = [v["name"] for v in AI_PROVIDERS.values()]
@@ -1084,7 +810,6 @@ class ReminderApp:
         self.provider_combo.current(provider_ids.index(self.cfg.get("ai_provider", "zhipu")))
         self.provider_combo.bind("<<ComboboxSelected>>", self._on_provider_change)
 
-        # AI 模型
         ttk.Label(ai_frame, text="AI 模型").grid(row=1, column=0, sticky="e", padx=(0, 8), pady=4)
         self.ai_model_var = tk.StringVar(value=self.cfg.get("ai_model", "glm-4-flash"))
         self.model_combo = ttk.Combobox(ai_frame, textvariable=self.ai_model_var,
@@ -1092,7 +817,6 @@ class ReminderApp:
         self.model_combo.grid(row=1, column=1, sticky="w", pady=4)
         self._update_model_list()
 
-        # API Key
         ttk.Label(ai_frame, text="API Key").grid(row=2, column=0, sticky="e", padx=(0, 8), pady=4)
         self.ai_key_var = tk.StringVar(value=self.cfg.get("ai_api_key", ""))
         ttk.Entry(ai_frame, textvariable=self.ai_key_var, width=52, show="*").grid(
@@ -1115,7 +839,6 @@ class ReminderApp:
         provider = AI_PROVIDERS[provider_id]
         model_names = [m["name"] for m in provider["models"]]
         self.model_combo["values"] = model_names
-        # 设置当前模型
         current_model = self.cfg.get("ai_model", provider["default_model"])
         for i, m in enumerate(provider["models"]):
             if m["id"] == current_model:
@@ -1144,6 +867,23 @@ class ReminderApp:
         save_config(self.cfg)
         messagebox.showinfo("成功", "设置已保存")
         self._load_events()
+
+    def _save_font_settings(self):
+        self.cfg["font_family"] = self.font_family_var.get()
+        try:
+            self.cfg["font_size"] = int(self.font_size_var.get())
+        except ValueError:
+            messagebox.showerror("错误", "字号必须是数字")
+            return
+        save_config(self.cfg)
+        messagebox.showinfo("成功", "字体设置已保存，重启程序后生效")
+
+    def _save_notify_settings(self):
+        self.cfg["enable_email"] = self.enable_email_var.get()
+        self.cfg["enable_desktop"] = self.enable_desktop_var.get()
+        self.cfg["minimize_to_tray"] = self.minimize_to_tray_var.get()
+        save_config(self.cfg)
+        messagebox.showinfo("成功", "通知设置已保存")
 
     def _save_ai_settings(self):
         provider_names = [v["name"] for v in AI_PROVIDERS.values()]
@@ -1194,159 +934,6 @@ class ReminderApp:
 
     def run(self):
         self.root.mainloop()
-
-
-# ============ 事件编辑对话框 ============
-
-class EventDialog:
-    def __init__(self, parent, title, reminder=None, callback=None):
-        self.callback = callback
-        self.reminder = reminder or {}
-        self.result = None
-        self.schedule_list = []  # 存储 schedule 数据
-
-        self.win = tk.Toplevel(parent)
-        self.win.title(title)
-        self.win.geometry("520x580")
-        self.win.resizable(False, False)
-        self.win.grab_set()
-
-        self._build()
-        if reminder:
-            self._fill(reminder)
-
-    def _build(self):
-        # 基本信息区域
-        info_frame = ttk.LabelFrame(self.win, text="事件信息", padding=10)
-        info_frame.pack(fill="x", padx=10, pady=(10, 5))
-
-        fields = [
-            ("事项名称 *", "name"),
-            ("类型", "type"),
-            ("地点", "location"),
-            ("周次", "week"),
-            ("日期", "date"),
-            ("时段", "time"),
-            ("开始日期", "start"),
-            ("结束日期", "end"),
-        ]
-        self.vars = {}
-        for i, (label, key) in enumerate(fields):
-            row, col = divmod(i, 2)
-            ttk.Label(info_frame, text=label).grid(row=row, column=col * 2, sticky="e", padx=(0, 4), pady=3)
-            var = tk.StringVar()
-            self.vars[key] = var
-            width = 18 if col == 1 else 16
-            ttk.Entry(info_frame, textvariable=var, width=width).grid(
-                row=row, column=col * 2 + 1, sticky="w", padx=(0, 12), pady=3)
-
-        # 类型提示
-        ttk.Label(info_frame, text="类型: exam/class/training/other", font=("", 8),
-                  foreground="gray").grid(row=4, column=0, columnspan=4, sticky="w")
-
-        # 每日安排区域
-        sched_frame = ttk.LabelFrame(self.win, text="每日安排（用于多日事件，如实训、课程）", padding=10)
-        sched_frame.pack(fill="both", expand=True, padx=10, pady=5)
-
-        # 已添加的安排列表
-        cols = ("day", "period", "location")
-        self.sched_tree = ttk.Treeview(sched_frame, columns=cols, show="headings", height=5)
-        self.sched_tree.heading("day", text="星期")
-        self.sched_tree.heading("period", text="时段")
-        self.sched_tree.heading("location", text="地点")
-        self.sched_tree.column("day", width=80)
-        self.sched_tree.column("period", width=100)
-        self.sched_tree.column("location", width=200)
-        self.sched_tree.pack(fill="both", expand=True, pady=(0, 8))
-
-        # 添加安排的输入区域
-        add_frame = ttk.Frame(sched_frame)
-        add_frame.pack(fill="x")
-
-        ttk.Label(add_frame, text="星期").pack(side="left", padx=(0, 4))
-        self.day_var = tk.StringVar(value="周一")
-        day_combo = ttk.Combobox(add_frame, textvariable=self.day_var, width=6,
-                                 values=["周一", "周二", "周三", "周四", "周五", "周六", "周日"],
-                                 state="readonly")
-        day_combo.pack(side="left", padx=(0, 8))
-
-        ttk.Label(add_frame, text="时段").pack(side="left", padx=(0, 4))
-        self.period_var = tk.StringVar(value="1-4")
-        period_combo = ttk.Combobox(add_frame, textvariable=self.period_var, width=8,
-                                    values=["1-4", "5-8", "evening", "全天"],
-                                    state="readonly")
-        period_combo.pack(side="left", padx=(0, 8))
-
-        ttk.Label(add_frame, text="地点").pack(side="left", padx=(0, 4))
-        self.sched_loc_var = tk.StringVar()
-        ttk.Entry(add_frame, textvariable=self.sched_loc_var, width=14).pack(side="left", padx=(0, 8))
-
-        ttk.Button(add_frame, text="添加", width=6, command=self._add_schedule).pack(side="left")
-        ttk.Button(add_frame, text="删除选中", width=8, command=self._del_schedule).pack(side="left", padx=(4, 0))
-
-        # 底部按钮
-        btn_frame = ttk.Frame(self.win)
-        btn_frame.pack(pady=10)
-        ttk.Button(btn_frame, text="确定", command=self._on_ok).pack(side="left", padx=8)
-        ttk.Button(btn_frame, text="取消", command=self.win.destroy).pack(side="left", padx=8)
-
-    def _add_schedule(self):
-        day = self.day_var.get()
-        period = self.period_var.get()
-        location = self.sched_loc_var.get().strip()
-
-        if not location:
-            messagebox.showwarning("提示", "请输入地点")
-            return
-
-        self.schedule_list.append({"day": day, "period": period, "location": location})
-        self.sched_tree.insert("", "end", values=(day, period, location))
-        self.sched_loc_var.set("")
-
-    def _del_schedule(self):
-        sel = self.sched_tree.selection()
-        if not sel:
-            return
-        for item in sel:
-            idx = self.sched_tree.index(item)
-            self.schedule_list.pop(idx)
-            self.sched_tree.delete(item)
-
-    def _fill(self, rem):
-        for key, var in self.vars.items():
-            val = rem.get(key, "")
-            if isinstance(val, date):
-                val = val.strftime("%Y-%m-%d")
-            var.set(str(val))
-        if "schedule" in rem:
-            self.schedule_list = rem["schedule"]
-            for entry in self.schedule_list:
-                self.sched_tree.insert("", "end", values=(
-                    entry.get("day", ""),
-                    entry.get("period", ""),
-                    entry.get("location", "")
-                ))
-
-    def _on_ok(self):
-        rem = {}
-        for key, var in self.vars.items():
-            val = var.get().strip()
-            if val:
-                rem[key] = val
-        if "name" not in rem:
-            messagebox.showwarning("提示", "事项名称不能为空")
-            return
-        # 类型校验
-        valid_types = ("exam", "class", "training", "other")
-        if rem.get("type") and rem["type"] not in valid_types:
-            messagebox.showwarning("提示", f"类型只能是：{', '.join(valid_types)}")
-            return
-        # schedule
-        if self.schedule_list:
-            rem["schedule"] = self.schedule_list
-        if self.callback:
-            self.callback(rem)
-        self.win.destroy()
 
 
 if __name__ == "__main__":

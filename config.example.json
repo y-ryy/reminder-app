@@ -7,5 +7,10 @@
   "receiver_email": "receiver@qq.com",
   "ai_provider": "zhipu",
   "ai_model": "glm-4-flash",
-  "ai_api_key": ""
+  "ai_api_key": "",
+  "enable_email": true,
+  "enable_desktop": true,
+  "minimize_to_tray": false,
+  "font_family": "微软雅黑",
+  "font_size": 14
 }

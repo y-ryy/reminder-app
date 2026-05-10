@@ -24,3 +24,7 @@ Thumbs.db
 # 日程数据文件
 *.yaml
 *.yml
+
+# 运行时数据
+data/
+chat_history.json
