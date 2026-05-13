@@ -2,7 +2,7 @@
 
 import json
 import os
-from datetime import date
+from datetime import date, datetime
 
 # ============ 路径 ============
 
@@ -11,10 +11,9 @@ PROJECT_DIR = os.path.dirname(SRC_DIR)
 DATA_DIR = os.path.join(PROJECT_DIR, "data")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 HISTORY_PATH = os.path.join(DATA_DIR, "chat_history.json")
+NOTIFICATION_HISTORY_PATH = os.path.join(DATA_DIR, "notification_history.json")
 
 # ============ 常量 ============
-
-SEMESTER_START = date(2026, 3, 2)
 
 AI_PROVIDERS = {
     "zhipu": {
@@ -51,8 +50,7 @@ DEFAULT_CONFIG = {
     "enable_email": True,
     "enable_desktop": True,
     "minimize_to_tray": False,
-    "font_family": "微软雅黑",
-    "font_size": 14,
+    "semester_start": "2026-03-02",
 }
 
 # ============ 配置读写 ============
@@ -71,3 +69,9 @@ def save_config(cfg):
     os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def get_semester_start(cfg):
+    """从配置中获取学期起始日，返回 date 对象"""
+    val = cfg.get("semester_start", "2026-03-02")
+    return datetime.strptime(str(val), "%Y-%m-%d").date()

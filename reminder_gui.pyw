@@ -15,9 +15,10 @@ SRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
-from config import load_config, save_config, AI_PROVIDERS, SEMESTER_START
+from config import load_config, save_config, AI_PROVIDERS, get_semester_start
 from storage import load_yaml, save_yaml, to_date_str, load_history, add_history, clear_history
-from notifications import send_email, send_email_silent, send_desktop
+from storage import load_notification_history
+from notifications import send_email, send_desktop
 from ai_service import call_ai_api
 from reminder_engine import (
     generate_reminders, auto_complete_timeout, regenerate_reminders,
@@ -71,6 +72,10 @@ class ReminderApp:
         self.frame_settings = ttk.Frame(notebook)
         notebook.add(self.frame_settings, text="设置")
         self._build_settings_tab()
+
+        self.frame_notify_history = ttk.Frame(notebook)
+        notebook.add(self.frame_notify_history, text="通知历史")
+        self._build_notify_history_tab()
 
     # ==================== 字体管理 ====================
 
@@ -294,6 +299,27 @@ class ReminderApp:
         self.checked = "☑"
         self.unchecked = "☐"
 
+        # 搜索/筛选栏
+        filter_frame = ttk.Frame(self.frame_events)
+        filter_frame.pack(fill="x", padx=6, pady=(6, 0))
+
+        ttk.Label(filter_frame, text="搜索").pack(side="left", padx=(0, 4))
+        self.search_var = tk.StringVar()
+        search_entry = ttk.Entry(filter_frame, textvariable=self.search_var, width=20)
+        search_entry.pack(side="left", padx=(0, 8))
+        search_entry.bind("<Return>", lambda e: self._load_events())
+
+        ttk.Label(filter_frame, text="类型").pack(side="left", padx=(0, 4))
+        self.filter_type_var = tk.StringVar(value="全部")
+        type_combo = ttk.Combobox(filter_frame, textvariable=self.filter_type_var,
+                                  values=["全部", "exam", "class", "training", "other"],
+                                  state="readonly", width=10)
+        type_combo.pack(side="left", padx=(0, 8))
+        type_combo.bind("<<ComboboxSelected>>", lambda e: self._load_events())
+
+        ttk.Button(filter_frame, text="搜索", command=self._load_events, width=6).pack(side="left", padx=(0, 4))
+        ttk.Button(filter_frame, text="重置", command=self._reset_filter, width=6).pack(side="left")
+
         cols = ("status", "type", "date", "week", "location")
         self.tree = ttk.Treeview(self.frame_events, columns=cols, show="tree headings", height=15)
         self.tree.heading("#0", text="事项名称")
@@ -342,16 +368,30 @@ class ReminderApp:
         auto_complete_timeout(self.cfg, data)
         regenerate_reminders(self.cfg, data)
 
+        # 搜索/筛选
+        search_text = self.search_var.get().strip().lower()
+        filter_type = self.filter_type_var.get()
+
         WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
         weekday_map = {"周一": 0, "周二": 1, "周三": 2, "周四": 3, "周五": 4, "周六": 5, "周日": 6}
         type_labels = {"exam": "考试", "class": "上课", "training": "实训", "other": "其他"}
         period_labels = {"1-4": "1~4节", "5-8": "5~8节", "evening": "晚课", "全天": "全天"}
+        semester_start = get_semester_start(self.cfg)
 
         def calc_week(d):
-            week_num = (d - SEMESTER_START).days // 7 + 1
+            week_num = (d - semester_start).days // 7 + 1
             return f"第{week_num}周{WEEKDAY_NAMES[d.weekday()]}"
 
         def get_sort_key(rem):
+            # 多日事件：按下一个待办子项日期排序
+            sub_items = rem.get("sub_items", {})
+            if sub_items and "start" in rem and "end" in rem:
+                pending_dates = sorted(d for d, v in sub_items.items() if not v.get("completed"))
+                if pending_dates:
+                    try:
+                        return datetime.strptime(pending_dates[0], "%Y-%m-%d").date()
+                    except ValueError:
+                        pass
             if "date" in rem:
                 try:
                     return datetime.strptime(str(rem["date"]), "%Y-%m-%d").date()
@@ -365,7 +405,7 @@ class ReminderApp:
             if "week" in rem:
                 try:
                     week_num = int(rem["week"].replace("第", "").replace("周", ""))
-                    return SEMESTER_START + timedelta(weeks=week_num - 1)
+                    return semester_start + timedelta(weeks=week_num - 1)
                 except ValueError:
                     pass
             return date.max
@@ -387,6 +427,12 @@ class ReminderApp:
         partial_events = []  # (idx, rem) 多日任务且部分完成
 
         for idx, rem in enumerate(reminders):
+            # 搜索/筛选
+            if search_text and search_text not in rem.get("name", "").lower():
+                continue
+            if filter_type != "全部" and rem.get("type") != filter_type:
+                continue
+
             has_schedule = "schedule" in rem and "start" in rem and "end" in rem
             sub_items = rem.get("sub_items", {})
             if has_schedule and sub_items:
@@ -400,32 +446,32 @@ class ReminderApp:
             else:
                 pending.append((idx, rem))
 
-        pending_sorted = sorted(pending, key=lambda x: get_sort_key(x[1]))
-        completed_sorted = sorted(completed, key=lambda x: get_completed_time(x[1]), reverse=True)
+        pending_sorted = sorted(pending + partial_events, key=lambda x: get_sort_key(x[1]))
+        completed_sorted = sorted(completed + partial_events, key=lambda x: get_sort_key(x[1]), reverse=True)
 
         # 未完成分组
-        pending_count = len(pending_sorted) + len(partial_events)
-        pending_parent = self.tree.insert("", "end", text=f"未完成 ({pending_count})", open=True)
+        pending_parent = self.tree.insert("", "end", text=f"未完成 ({len(pending_sorted)})", open=True)
         self._rem_index_map[pending_parent] = (-1, None)
 
         for idx, rem in pending_sorted:
+            has_schedule = "schedule" in rem and "start" in rem and "end" in rem
+            sub_items = rem.get("sub_items", {})
+            is_partial = has_schedule and sub_items and 0 < sum(1 for v in sub_items.values() if v.get("completed")) < len(sub_items)
+            filter_sub = "pending" if is_partial else None
             self._insert_reminder(pending_parent, idx, rem, type_labels, period_labels,
-                                  calc_week, weekday_map, completed=False)
-        for idx, rem in partial_events:
-            self._insert_reminder(pending_parent, idx, rem, type_labels, period_labels,
-                                  calc_week, weekday_map, completed=False, filter_sub="pending")
+                                  calc_week, weekday_map, completed=False, filter_sub=filter_sub)
 
         # 已完成分组
-        completed_count = len(completed_sorted) + len(partial_events)
-        completed_parent = self.tree.insert("", "end", text=f"已完成 ({completed_count})", open=True)
+        completed_parent = self.tree.insert("", "end", text=f"已完成 ({len(completed_sorted)})", open=True)
         self._rem_index_map[completed_parent] = (-1, None)
 
         for idx, rem in completed_sorted:
+            has_schedule = "schedule" in rem and "start" in rem and "end" in rem
+            sub_items = rem.get("sub_items", {})
+            is_partial = has_schedule and sub_items and 0 < sum(1 for v in sub_items.values() if v.get("completed")) < len(sub_items)
+            filter_sub = "completed" if is_partial else None
             self._insert_reminder(completed_parent, idx, rem, type_labels, period_labels,
-                                  calc_week, weekday_map, completed=True)
-        for idx, rem in partial_events:
-            self._insert_reminder(completed_parent, idx, rem, type_labels, period_labels,
-                                  calc_week, weekday_map, completed=True, filter_sub="completed")
+                                  calc_week, weekday_map, completed=True, filter_sub=filter_sub)
 
     def _insert_reminder(self, parent, idx, rem, type_labels, period_labels, calc_week, weekday_map, completed, filter_sub=None):
         name = rem.get("name", "")
@@ -519,6 +565,11 @@ class ReminderApp:
                                        values=(status, rtype, date_str, week_str, loc),
                                        tags=tags)
             self._rem_index_map[item_id] = (idx, None)
+
+    def _reset_filter(self):
+        self.search_var.set("")
+        self.filter_type_var.set("全部")
+        self._load_events()
 
     def _on_tree_click(self, event):
         region = self.tree.identify_region(event.x, event.y)
@@ -761,6 +812,7 @@ class ReminderApp:
             ("发件邮箱地址", "sender_email", False),
             ("SMTP 授权码", "sender_password", False),
             ("收件邮箱地址", "receiver_email", False),
+            ("学期起始日", "semester_start", False),
         ]
         self.setting_vars = {}
         for i, (label, key, browse) in enumerate(fields):
@@ -931,6 +983,50 @@ class ReminderApp:
             messagebox.showinfo("成功", "测试邮件已发送，请检查收件箱")
         except Exception as e:
             messagebox.showerror("发送失败", str(e))
+
+    # ==================== 通知历史 ====================
+
+    def _build_notify_history_tab(self):
+        btn_frame = ttk.Frame(self.frame_notify_history)
+        btn_frame.pack(fill="x", padx=6, pady=(6, 0))
+        ttk.Button(btn_frame, text="刷新", command=self._load_notify_history).pack(side="left")
+        ttk.Button(btn_frame, text="清空", command=self._clear_notify_history).pack(side="left", padx=(6, 0))
+
+        cols = ("time", "title", "message")
+        self.notify_tree = ttk.Treeview(self.frame_notify_history, columns=cols, show="headings", height=20)
+        self.notify_tree.heading("time", text="时间")
+        self.notify_tree.heading("title", text="标题")
+        self.notify_tree.heading("message", text="内容")
+        self.notify_tree.column("time", width=150)
+        self.notify_tree.column("title", width=200)
+        self.notify_tree.column("message", width=450)
+
+        scrollbar = ttk.Scrollbar(self.frame_notify_history, orient="vertical", command=self.notify_tree.yview)
+        self.notify_tree.configure(yscrollcommand=scrollbar.set)
+        self.notify_tree.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
+        scrollbar.pack(side="left", fill="y", pady=6, padx=(0, 6))
+
+        self._load_notify_history()
+
+    def _load_notify_history(self):
+        for item in self.notify_tree.get_children():
+            self.notify_tree.delete(item)
+        data = load_notification_history()
+        for entry in reversed(data.get("history", [])):
+            self.notify_tree.insert("", "end", values=(
+                entry.get("time", ""),
+                entry.get("title", ""),
+                entry.get("message", ""),
+            ))
+
+    def _clear_notify_history(self):
+        if not messagebox.askyesno("确认", "确定要清空所有通知历史吗？"):
+            return
+        from storage import NOTIFICATION_HISTORY_PATH
+        import json
+        with open(NOTIFICATION_HISTORY_PATH, "w", encoding="utf-8") as f:
+            json.dump({"history": []}, f)
+        self._load_notify_history()
 
     def run(self):
         self.root.mainloop()

@@ -112,7 +112,7 @@ def call_ai_api(cfg, user_input):
                 except ValueError:
                     pass
 
-        # 后处理：修正 schedule 中的 day 和去重
+        # 后处理：修正 schedule 中缺失的 day 并去重
         if "schedule" in event_data and "start" in event_data:
             try:
                 start_date = datetime.strptime(event_data["start"], "%Y-%m-%d").date()
@@ -120,7 +120,8 @@ def call_ai_api(cfg, user_input):
                 seen = set()
                 unique_schedule = []
                 for entry in event_data["schedule"]:
-                    entry["day"] = weekday_names[start_date.weekday()]
+                    if not entry.get("day"):
+                        entry["day"] = weekday_names[start_date.weekday()]
                     key = (entry.get("day"), entry.get("period"))
                     if key not in seen:
                         seen.add(key)

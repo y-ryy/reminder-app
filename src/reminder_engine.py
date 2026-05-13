@@ -1,16 +1,19 @@
 """提醒生成、自动完成、定时检查"""
 
+import sys
 import threading
 import time
 from datetime import datetime, date, timedelta
 
-from config import SEMESTER_START
+from config import get_semester_start
 from storage import load_yaml, save_yaml
-from notifications import send_email_silent
+from notifications import send_email
 
 
-def generate_reminders(rem):
+def generate_reminders(rem, semester_start=None):
     """根据事件精度自动生成提醒时间点"""
+    if semester_start is None:
+        semester_start = date(2026, 3, 2)
     period_hours = {"1-4": 6, "5-8": 10, "evening": 14, "全天": 7}
     reminders = []
 
@@ -22,7 +25,7 @@ def generate_reminders(rem):
     if "week" in rem and "date" not in rem and "start" not in rem:
         try:
             week_num = int(rem["week"].replace("第", "").replace("周", ""))
-            week_monday = SEMESTER_START + timedelta(weeks=week_num - 1)
+            week_monday = semester_start + timedelta(weeks=week_num - 1)
             prev_monday = week_monday - timedelta(days=7)
             prev_sunday = week_monday - timedelta(days=1)
             reminders.append({"time": f"{prev_monday} 20:00", "sent": False})
@@ -65,12 +68,13 @@ def auto_complete_timeout(cfg, data):
     now = datetime.now()
     today = now.date()
     changed = False
+    semester_start = get_semester_start(cfg)
 
     for rem in data.get("reminders", []):
         if rem.get("completed"):
             continue
 
-        event_date = rem.get("date") or rem.get("start")
+        event_date = rem.get("date") or rem.get("end") or rem.get("start")
         if event_date:
             try:
                 event_dt = datetime.strptime(str(event_date), "%Y-%m-%d").date()
@@ -83,7 +87,7 @@ def auto_complete_timeout(cfg, data):
         elif rem.get("week"):
             try:
                 week_num = int(rem["week"].replace("第", "").replace("周", ""))
-                week_monday = SEMESTER_START + timedelta(weeks=week_num - 1)
+                week_monday = semester_start + timedelta(weeks=week_num - 1)
                 next_monday = week_monday + timedelta(days=7)
                 if today >= next_monday:
                     rem["completed"] = True
@@ -99,9 +103,10 @@ def auto_complete_timeout(cfg, data):
 def regenerate_reminders(cfg, data):
     """为缺少提醒点的事件自动生成（迁移旧数据）"""
     changed = False
+    semester_start = get_semester_start(cfg)
     for rem in data.get("reminders", []):
         if "reminders" not in rem:
-            generate_reminders(rem)
+            generate_reminders(rem, semester_start)
             changed = True
     if changed:
         save_yaml(cfg["yaml_path"], data)
@@ -111,7 +116,8 @@ def send_startup_reminder(cfg):
     """启动时发送今天和明天的未完成任务汇总"""
     try:
         data = load_yaml(cfg["yaml_path"])
-    except Exception:
+    except Exception as e:
+        print(f"[提醒] 启动汇总加载数据失败: {e}", file=sys.stderr)
         return
 
     today = date.today()
@@ -163,7 +169,7 @@ def send_startup_reminder(cfg):
     lines.append("此邮件由日程提醒工具自动发送")
 
     message = "\n".join(lines)
-    send_email_silent(cfg, f"日程提醒：今日{len(today_tasks)}项 明日{len(tomorrow_tasks)}项", message)
+    send_email(cfg, f"日程提醒：今日{len(today_tasks)}项 明日{len(tomorrow_tasks)}项", message, silent=True)
 
 
 def start_reminder_checker(cfg):
@@ -177,15 +183,16 @@ def _reminder_checker_loop(cfg):
         time.sleep(60)
         try:
             _check_due_reminders(cfg)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[提醒] 检查提醒时出错: {e}", file=sys.stderr)
 
 
 def _check_due_reminders(cfg):
-    """检查并发送到期的定时提醒"""
+    """检查并发送到期的定时提醒（补发错过的提醒）"""
     try:
         data = load_yaml(cfg["yaml_path"])
-    except Exception:
+    except Exception as e:
+        print(f"[提醒] 加载数据失败: {e}", file=sys.stderr)
         return
 
     now = datetime.now()
@@ -200,7 +207,7 @@ def _check_due_reminders(cfg):
             if reminder.get("sent"):
                 continue
             reminder_time = reminder.get("time", "")
-            if reminder_time == now_str:
+            if reminder_time <= now_str:
                 name = rem.get("name", "")
                 loc = rem.get("location", "")
                 event_date = rem.get("date") or rem.get("start") or ""
@@ -218,7 +225,7 @@ def _check_due_reminders(cfg):
                     parts.append(f"周次：{week}")
                 parts.append("\n此邮件由日程提醒工具自动发送")
                 message = "\n".join(parts)
-                send_email_silent(cfg, f"日程提醒：{name}", message)
+                send_email(cfg, f"日程提醒：{name}", message, silent=True)
                 reminder["sent"] = True
                 changed = True
 
