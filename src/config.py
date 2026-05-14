@@ -51,6 +51,7 @@ DEFAULT_CONFIG = {
     "enable_desktop": True,
     "minimize_to_tray": False,
     "semester_start": "2026-03-02",
+    "export_md_path": "",
 }
 
 # ============ 配置读写 ============

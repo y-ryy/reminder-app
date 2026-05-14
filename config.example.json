@@ -12,6 +12,7 @@
   "enable_desktop": true,
   "minimize_to_tray": false,
   "semester_start": "2026-03-02",
+  "export_md_path": "",
   "font_family": "微软雅黑",
   "font_size": 14
 }

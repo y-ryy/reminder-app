@@ -17,7 +17,7 @@ if SRC_DIR not in sys.path:
 
 from config import load_config, save_config, AI_PROVIDERS, get_semester_start
 from storage import load_yaml, save_yaml, to_date_str, load_history, add_history, clear_history
-from storage import load_notification_history
+from storage import load_notification_history, export_to_md
 from notifications import send_email, send_desktop
 from ai_service import call_ai_api
 from reminder_engine import (
@@ -103,9 +103,12 @@ class ReminderApp:
 
     def _setup_tray(self):
         self.root.protocol("WM_DELETE_WINDOW", self._on_window_close)
+        self.tray_icon = self._create_tray_icon()
+        if self.tray_icon:
+            threading.Thread(target=self.tray_icon.run, daemon=True).start()
 
     def _create_tray_icon(self):
-        """每次最小化时创建新的托盘图标"""
+        """创建托盘图标（启动时创建一次）"""
         try:
             import pystray
             from PIL import Image
@@ -136,26 +139,12 @@ class ReminderApp:
             self._exit_app()
 
     def _minimize_to_tray(self):
-        if self.tray_icon:
-            try:
-                self.tray_icon.stop()
-            except Exception:
-                pass
-        self.tray_icon = self._create_tray_icon()
-        if self.tray_icon:
-            self.root.withdraw()
-            threading.Thread(target=self.tray_icon.run, daemon=True).start()
+        self.root.withdraw()
 
     def _restore_from_tray(self, icon=None, item=None):
         self.root.after(0, self._do_restore)
 
     def _do_restore(self):
-        if self.tray_icon:
-            try:
-                self.tray_icon.stop()
-            except Exception:
-                pass
-            self.tray_icon = None
         self.root.deiconify()
         self.root.lift()
 
@@ -663,7 +652,7 @@ class ReminderApp:
                     sub["completed"] = True
                     sub["completed_at"] = now_str
 
-        save_yaml(self.cfg["yaml_path"], data)
+        save_yaml(self.cfg["yaml_path"], data, self.cfg)
         self._load_events()
 
     def _show_ctx_menu(self, event):
@@ -694,7 +683,7 @@ class ReminderApp:
         generate_reminders(rem)
         data = load_yaml(self.cfg["yaml_path"])
         data.setdefault("reminders", []).append(rem)
-        save_yaml(self.cfg["yaml_path"], data)
+        save_yaml(self.cfg["yaml_path"], data, self.cfg)
         self._load_events()
 
     def _edit_event(self):
@@ -710,7 +699,7 @@ class ReminderApp:
         generate_reminders(rem)
         data = load_yaml(self.cfg["yaml_path"])
         data["reminders"][idx] = rem
-        save_yaml(self.cfg["yaml_path"], data)
+        save_yaml(self.cfg["yaml_path"], data, self.cfg)
         self._load_events()
 
     def _delete_event(self):
@@ -722,7 +711,7 @@ class ReminderApp:
         if not messagebox.askyesno("确认删除", f"确定要删除「{name}」吗？"):
             return
         data["reminders"].pop(idx)
-        save_yaml(self.cfg["yaml_path"], data)
+        save_yaml(self.cfg["yaml_path"], data, self.cfg)
         self._load_events()
 
     def _test_push(self):
@@ -824,6 +813,7 @@ class ReminderApp:
             ("SMTP 授权码", "sender_password", False),
             ("收件邮箱地址", "receiver_email", False),
             ("学期起始日", "semester_start", False),
+            ("MD 导出路径", "export_md_path", True),
         ]
         self.setting_vars = {}
         for i, (label, key, browse) in enumerate(fields):
@@ -833,13 +823,15 @@ class ReminderApp:
             entry = ttk.Entry(mail_frame, textvariable=var, width=52, show="*" if "password" in key else "")
             entry.grid(row=i, column=1, sticky="w", pady=4)
             if browse:
+                cmd = (lambda v=var, k=key: self._browse_md_export(v) if k == "export_md_path" else self._browse_yaml(v))
                 ttk.Button(mail_frame, text="浏览", width=6,
-                           command=lambda v=var: self._browse_yaml(v)).grid(row=i, column=2, padx=(6, 0), pady=4)
+                           command=cmd).grid(row=i, column=2, padx=(6, 0), pady=4)
 
         mail_btn_frame = ttk.Frame(mail_frame)
         mail_btn_frame.grid(row=len(fields), column=0, columnspan=3, pady=(12, 0))
         ttk.Button(mail_btn_frame, text="保存设置", command=self._save_settings).pack(side="left", padx=4)
         ttk.Button(mail_btn_frame, text="测试邮件", command=self._test_email).pack(side="left", padx=4)
+        ttk.Button(mail_btn_frame, text="手动导出", command=self._manual_export).pack(side="left", padx=4)
 
         # 通知方式
         notify_frame = ttk.LabelFrame(scrollable_frame, text="通知方式", padding=12)
@@ -914,6 +906,11 @@ class ReminderApp:
             title="选择 YAML 文件",
             filetypes=[("YAML 文件", "*.yaml;*.yml"), ("所有文件", "*.*")]
         )
+        if path:
+            var.set(path)
+
+    def _browse_md_export(self, var):
+        path = filedialog.askdirectory(title="选择 MD 导出目录")
         if path:
             var.set(path)
 
@@ -994,6 +991,18 @@ class ReminderApp:
             messagebox.showinfo("成功", "测试邮件已发送，请检查收件箱")
         except Exception as e:
             messagebox.showerror("发送失败", str(e))
+
+    def _manual_export(self):
+        export_dir = self.setting_vars.get("export_md_path")
+        if not export_dir or not export_dir.get().strip():
+            messagebox.showwarning("提示", "请先设置 MD 导出目录")
+            return
+        try:
+            data = load_yaml(self.cfg["yaml_path"])
+            export_to_md(data, export_dir.get().strip())
+            messagebox.showinfo("成功", f"已导出到 {export_dir.get().strip()}")
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
 
     # ==================== 通知历史 ====================
 

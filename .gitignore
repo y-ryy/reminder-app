@@ -29,3 +29,4 @@ Thumbs.db
 data/
 chat_history.json
 notification_history.json
+.claude/

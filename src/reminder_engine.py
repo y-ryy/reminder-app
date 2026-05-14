@@ -97,7 +97,7 @@ def auto_complete_timeout(cfg, data):
                 pass
 
     if changed:
-        save_yaml(cfg["yaml_path"], data)
+        save_yaml(cfg["yaml_path"], data, cfg)
 
 
 def regenerate_reminders(cfg, data):
@@ -109,7 +109,7 @@ def regenerate_reminders(cfg, data):
             generate_reminders(rem, semester_start)
             changed = True
     if changed:
-        save_yaml(cfg["yaml_path"], data)
+        save_yaml(cfg["yaml_path"], data, cfg)
 
 
 def send_startup_reminder(cfg):
@@ -230,4 +230,4 @@ def _check_due_reminders(cfg):
                 changed = True
 
     if changed:
-        save_yaml(cfg["yaml_path"], data)
+        save_yaml(cfg["yaml_path"], data, cfg)
