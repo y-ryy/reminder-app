@@ -136,6 +136,11 @@ class ReminderApp:
             self._exit_app()
 
     def _minimize_to_tray(self):
+        if self.tray_icon:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
         self.tray_icon = self._create_tray_icon()
         if self.tray_icon:
             self.root.withdraw()
@@ -145,6 +150,12 @@ class ReminderApp:
         self.root.after(0, self._do_restore)
 
     def _do_restore(self):
+        if self.tray_icon:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+            self.tray_icon = None
         self.root.deiconify()
         self.root.lift()
 
